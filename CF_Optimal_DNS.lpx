@@ -1,0 +1,31 @@
+#!name = Cloudflare 优选 IP 自动换源
+#!desc = 自动拉取 CM 每日优选反代 IP，支持手机本地二次测速筛选，并自动替换 Cloudflare DNS A 记录，助力 Emby 满速播放。
+#!author = 你的GitHub名字
+#!homepage = https://github.com/你的用户名/你的仓库名
+#!date = 2026-11-16 12:00:00
+#!system = iOS, iPadOS, macOS
+#!system_version = 18
+#!loon_version = 3.5.1(998)
+
+[Argument]
+# 1. 下拉菜单 (select) —— 就像截图中带上下箭头的选项
+isp_type = select, "CM_移动", "CT_电信", "CU_联通", "ALL_三网", "Custom_自定义", tag = [优选源]运营商线路, desc = 选择对应运营商的每日优选 IP 库，或选择自定义源。
+
+ip_count = select, "3", "1", "2", "5", tag = [DNS]替换 IP 数量, desc = 挑选前几个最优 IP 写入 Cloudflare 同名 A 记录实现轮询负载均衡。
+
+# 2. 开关 (switch)
+enable_probe = switch, true, tag = [本地优选]手机端二次测速, desc = 开启后将通过当前手机网络对候选 IP 进行并发连接测速，挑出本地真正最快的节点。
+
+# 3. 文本输入框 (input) —— 供每个用户填写自己的私密参数
+cf_token = input, "", tag = [API]Cloudflare 令牌, desc = 必填：填入具有 Zone.DNS 编辑权限的 API Token。
+
+zone_id = input, "", tag = [API]域名 Zone ID, desc = 必填：在 Cloudflare 域名概述页面右下角获取。
+
+record_name = input, "emby.example.com", tag = [DNS]反代子域名, desc = 必填：需要自动替换优选 IP 的完整域名。
+
+custom_api = input, "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu", tag = [高级]自定义 IP 源链接, desc = 当优选源选择 Custom 或默认拉取 CM 库时使用的在线文本/API 地址（每行一个 IP）。
+
+cron_exp = input, "0 4 * * *", tag = [定时]Cron 表达式, desc = 默认每天凌晨 4 点自动执行一次优选与 DNS 更新。
+
+[Script]
+cron {cron_exp} script-path = https://raw.githubusercontent.com/你的用户名/你的仓库名/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 120, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
