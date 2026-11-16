@@ -1,5 +1,5 @@
-#!name = CF 优选 DNS 单源版
-#!desc = 使用单一 CF 优选 IP 数据源，支持手机本地二次测速，并自动更新 Cloudflare DNS；失败时保留原记录。
+#!name = CF 优选 DNS 更新修复版
+#!desc = 恢复之前可解析的单次数据源读取方式；支持 CFYes、Mia、WeTest、UOUIN 和自定义线路，支持可选本地测速及 Cloudflare DNS 更新。
 #!author = @wssder
 #!homepage = https://github.com/wssder/loon-js
 #!date = 2026-11-16
@@ -7,13 +7,14 @@
 #!loon_version = 3.5.1
 
 [Argument]
-ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取前 N 个 IP。
-enable_probe = switch, false, tag = [测速]手机本地二次测速, desc = 开启后对候选 IP 进行本地并发测速；关闭则直接选取数据源前 N 个 IP。
+isp_type = select, "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 选择 IP 数据源。
+ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取最快或列表靠前的前 N 个 IP。
+enable_probe = switch, false, tag = [测速]手机本地二次测速, desc = 开启后通过手机网络测速；关闭则直接使用数据源前 N 个 IP。
 cf_token = input, "", tag = [Cloudflare]API Token, desc = 需要具有 Zone DNS 编辑权限。
 zone_id = input, "", tag = [Cloudflare]Zone ID, desc = Cloudflare 域名 Zone ID。
 record_name = input, "", tag = [DNS]域名, desc = 需要更新的完整 DNS 主机名。
-custom_api = input, "https://bestcf.tools12345.com/cmliu2/all.txt", tag = [数据源]单一 IP API, desc = 单一数据源地址；默认恢复到之前成功返回 15 个 IP 的地址。
+custom_api = input, "https://bestcf.tools12345.com/cmliu2/all.txt", tag = [高级]自定义 API, desc = 选择 Custom_自定义 时使用的 IP 文本源地址。
 cron_exp = input, "0 4 * * *", tag = [定时]Cron, desc = 默认每天凌晨 4 点运行。
 
 [Script]
-cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 180, argument = [Custom_自定义,{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
+cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
