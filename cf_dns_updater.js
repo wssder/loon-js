@@ -21,8 +21,8 @@ const CUSTOM_API = String(args.custom_api || "").trim();
 const SINGLE_SOURCE_URL = CUSTOM_API || "https://bestcf.tools12345.com/cmliu2/all.txt";
 
 const SOURCE_TIMEOUT = 10;
-const PROBE_TIMEOUT = 8;
-const CF_TIMEOUT = 20;
+const PROBE_TIMEOUT = 3000;
+const CF_TIMEOUT = 15000;
 const PROBE_CONCURRENCY = 4;
 const MAX_CANDIDATES = 30;
 
@@ -32,9 +32,21 @@ function log(message) {
 
 function httpRequest(method, options) {
   return new Promise((resolve, reject) => {
-    $httpClient[method.toLowerCase()](options, (err, resp, data) => {
-      if (err) return reject(err);
-      resolve({ resp: resp || {}, data: data == null ? "" : String(data) });
+    const fn = $httpClient[String(method).toLowerCase()];
+    if (typeof fn !== "function") {
+      reject(new Error("不支持 HTTP 方法: " + method));
+      return;
+    }
+    // Loon 环境需要保留 $httpClient 的调用上下文。
+    fn.call($httpClient, options, (err, resp, data) => {
+      if (err) {
+        reject(new Error(method.toUpperCase() + " 请求失败: " + String(err)));
+        return;
+      }
+      resolve({
+        resp: resp || {},
+        data: data == null ? "" : String(data)
+      });
     });
   });
 }
@@ -147,7 +159,13 @@ async function main() {
   log("正在拉取 IP 数据源：" + sourceUrl);
 
   // 数据源读取保持原版方式：不更换用户自定义 URL、不强制切换备用源。
-  const sourceResult = await httpGet({ url: sourceUrl, timeout: SOURCE_TIMEOUT });
+  const sourceResult = await httpGet({
+    url: sourceUrl,
+    timeout: SOURCE_TIMEOUT,
+    headers: {
+      "User-Agent": "Loon-CF-DNS-Updater/1.0"
+    }
+  });
   const sourceStatus = Number(sourceResult.resp.status || sourceResult.resp.statusCode || 0);
   log("数据源 HTTP 状态：" + sourceStatus);
   log("数据源响应长度：" + sourceResult.data.length);
