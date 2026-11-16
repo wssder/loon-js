@@ -97,24 +97,28 @@ function extractIPs(text) {
 }
 
 async function probeIP(ip) {
-    // 1. 预过滤已知不支持普通域名 A 记录解析的 CF 专用/受限网段 (如 172.64.128.0/17、DNS/WARP 段)
-    const parts = String(ip).split(".").map(Number);
+    // 1. 过滤在 Cloudflare 免费版域名下会触发 Error 1034 (Edge IP Restricted) 的受限/专用网段
+    const p = String(ip).split(".").map(Number);
     if (
-        parts.length !== 4 ||
-        parts[0] === 127 ||
-        parts[0] === 0 ||
-        (parts[0] === 1 && (parts[1] === 1 || parts[1] === 0)) ||
-        (parts[0] === 172 && parts[1] === 64 && parts[2] >= 128) ||
-        (parts[0] === 162 && parts[1] === 159 && (parts[2] === 36 || parts[2] === 46 || (parts[2] >= 192 && parts[2] <= 199)))
+        p.length !== 4 ||
+        p.some(n => isNaN(n) || n < 0 || n > 255) ||
+        p[0] === 127 ||
+        p[0] === 0 ||
+        (p[0] === 1 && (p[1] === 1 || p[1] === 0)) ||
+        (p[0] === 172 && ((p[1] === 64 && p[2] >= 128) || p[1] === 65 || p[1] === 66)) ||
+        (p[0] === 104 && (p[1] === 17 || p[1] === 18)) ||
+        (p[0] === 162 && p[1] === 159 && (p[2] === 36 || p[2] === 46 || (p[2] >= 192 && p[2] <= 199)))
     ) {
         log("跳过受限网段 " + ip);
         return { ip: ip, latency: 99999, ok: false };
     }
 
+    const validStatuses = [200, 204, 301, 302, 303, 307, 308, 400, 403];
+
     try {
-        // 2. 第一阶段：强制本地直连 (DIRECT) 校验 Cloudflare 边缘节点指纹 (/cdn-cgi/trace)
+        // 2. 第一轮 HTTP 本地直连探测 (参考 ProxyHub_Emby：收到 200/403 等状态码均代表 CF 边缘节点已连通)
         const t1 = Date.now();
-        const traceRes = await httpRequest("get", {
+        const res1 = await httpRequest("get", {
             url: "http://" + ip + "/cdn-cgi/trace",
             node: "DIRECT",
             "auto-redirect": false,
@@ -124,83 +128,73 @@ async function probeIP(ip) {
             },
             timeout: HTTP_TIMEOUT_PROBE
         });
-        const httpRtt1 = Date.now() - t1;
-        const traceStatus = Number(traceRes.resp.status || traceRes.resp.statusCode || 0);
-        const traceBody = String(traceRes.data || "");
-
-        if (traceStatus !== 200 || !traceBody.includes("fl=") || !traceBody.includes("colo=")) {
-            throw new Error("非有效 CF 边缘节点 (HTTP " + traceStatus + ")");
+        const rtt1 = Date.now() - t1;
+        const status1 = Number(res1.resp.status || res1.resp.statusCode || 0);
+        if (!validStatuses.includes(status1) || rtt1 < 8) {
+            throw new Error("HTTP 响应异常 (状态 " + status1 + ", " + rtt1 + "ms)");
         }
-        if (httpRtt1 < 10) {
-            throw new Error("延迟异常过低 (" + httpRtt1 + "ms)，疑似本地劫持");
-        }
-        const coloMatch = traceBody.match(/colo=([A-Z]{3})/);
-        const colo = coloMatch ? coloMatch[1] : "UNK";
 
-        // 3. 第二阶段：携带真实反代域名 Host 校验业务路由（剔除触发 Error 1034/1000/1003/403/522 的不可用 IP）
+        // 从响应头 cf-ray 或响应体提取机房三字码 (如 HKG / SJC / LAX / NRT)
+        const respHeaders = res1.resp.headers || {};
+        const cfRay = String(respHeaders["cf-ray"] || respHeaders["CF-RAY"] || respHeaders["Cf-Ray"] || "");
+        const bodyText = String(res1.data || "");
+        const rayMatch = cfRay.match(/-([A-Z]{3})$/i);
+        const coloMatch = bodyText.match(/colo=([A-Z]{3})/);
+        const colo = (rayMatch ? rayMatch[1] : (coloMatch ? coloMatch[1] : "CF")).toUpperCase();
+
+        // 3. 第二轮 HTTP 复测：确保 0 丢包并计算网络抖动 (Jitter)
         const t2 = Date.now();
-        const hostRes = await httpRequest("get", {
-            url: "http://" + ip + "/",
+        const res2 = await httpRequest("get", {
+            url: "http://" + ip + "/cdn-cgi/trace",
             node: "DIRECT",
             "auto-redirect": false,
             headers: {
-                "Host": RECORD_NAME,
                 "User-Agent": "Mozilla/5.0",
                 "Connection": "close"
             },
             timeout: HTTP_TIMEOUT_PROBE
         });
-        const httpRtt2 = Date.now() - t2;
-        const hostStatus = Number(hostRes.resp.status || hostRes.resp.statusCode || 0);
-        const hostBody = String(hostRes.data || "");
-
-        const validHostStatus = [200, 204, 301, 302, 303, 307, 308, 401, 404].includes(hostStatus);
-        const hasCfEdgeError = /error code:\s*10\d\d|Edge IP Restricted|prohibited IP|Direct IP access|cf-error-code/i.test(hostBody);
-        if (!validHostStatus || hasCfEdgeError) {
-            throw new Error("不支持当前反代域名 (HTTP " + hostStatus + ")");
+        const rtt2 = Date.now() - t2;
+        const status2 = Number(res2.resp.status || res2.resp.statusCode || 0);
+        if (!validStatuses.includes(status2)) {
+            throw new Error("二次复测丢包 (状态 " + status2 + ")");
         }
 
-        // 4. 第三阶段：探测 443 端口 (HTTPS) 真机可达性与握手延迟
+        // 4. 第三轮 443 端口 (HTTPS) 可达性验证：确保运营商未阻断该 IP 的 443 端口
         const t3 = Date.now();
         let tlsRtt = 0;
         try {
-            const tlsRes = await httpRequest("get", {
+            const res3 = await httpRequest("get", {
                 url: "https://" + ip + "/cdn-cgi/trace",
                 node: "DIRECT",
                 "auto-redirect": false,
                 insecure: true,
-                alpn: "h1",
-                headers: {
-                    "Host": RECORD_NAME,
-                    "User-Agent": "Mozilla/5.0",
-                    "Connection": "close"
-                },
                 timeout: HTTP_TIMEOUT_PROBE
             });
-            const tlsStatus = Number(tlsRes.resp.status || tlsRes.resp.statusCode || 0);
-            if (tlsStatus <= 0 || tlsStatus === 403 || tlsStatus >= 500) {
-                throw new Error("HTTPS 状态异常 (" + tlsStatus + ")");
+            const status3 = Number(res3.resp.status || res3.resp.statusCode || 0);
+            if (status3 <= 0) {
+                throw new Error("HTTPS 状态无效");
             }
             tlsRtt = Date.now() - t3;
         } catch (tlsErr) {
             const elapsed = Date.now() - t3;
             const errMsg = String(tlsErr && tlsErr.message ? tlsErr.message : tlsErr);
-            const isAlive443Alert =
+            const isPort443Alive =
                 /handshake failure|0A000410|reason:1040/i.test(errMsg) &&
                 /errno:0\b/.test(errMsg) &&
                 elapsed < HTTP_TIMEOUT_PROBE;
-            if (!isAlive443Alert) {
-                throw new Error("443 端口被阻断或不通: " + errMsg);
+            if (!isPort443Alive) {
+                throw new Error("443 端口不通或超时");
             }
-            tlsRtt = Math.round(elapsed / 2);
+            tlsRtt = elapsed;
         }
 
-        // 5. 综合延迟评分：结合 HTTP 平均延迟、443 端口延迟与两次请求抖动 (Jitter)
-        const avgHttp = Math.round((httpRtt1 + httpRtt2) / 2);
-        const jitter = Math.abs(httpRtt2 - httpRtt1);
-        const score = Math.round(avgHttp * 0.4 + tlsRtt * 0.6 + jitter * 0.5);
+        // 5. 计算综合评分：双轮 HTTP 均值 + 443 端口响应 + 抖动惩罚
+        const avgHttp = Math.round((rtt1 + rtt2) / 2);
+        const jitter = Math.abs(rtt2 - rtt1);
+        const score = Math.round(avgHttp * 0.5 + tlsRtt * 0.3 + jitter * 0.5);
 
-        log("测速可用 " + ip + " [" + colo + "]: 综合 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)");
+        log("测速可达 " + ip + " [" + colo + "]: 评分 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)");
         return {
             ip: ip,
             colo: colo,
@@ -209,7 +203,7 @@ async function probeIP(ip) {
             tlsRtt: tlsRtt,
             jitter: jitter,
             ok: true,
-            httpStatus: hostStatus
+            httpStatus: status1
         };
     } catch (e) {
         log("测速淘汰 " + ip + ": " + String(e && e.message ? e.message : e));
