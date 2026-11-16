@@ -7,7 +7,7 @@
 #!loon_version = 3.5.1
 
 [Argument]
-isp_type = select, "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 选择优选 IP 数据源。
+isp_type = select, "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 优先使用所选数据源；超时或返回网页时自动尝试备用纯文本 IP 源。
 ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取最快的前 N 个 IP。
 enable_probe = switch, true, tag = [测速]手机本地二次测速, desc = 开启后使用当前网络对候选 IP 并发测速；关闭则直接取数据源前 N 个 IP。
 cf_token = input, "", tag = [Cloudflare]API Token, desc = 需要具有 Zone DNS 编辑权限。
