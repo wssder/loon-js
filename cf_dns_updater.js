@@ -97,7 +97,7 @@ function extractIPs(text) {
 }
 
 async function probeIP(ip) {
-    // 1. 过滤在 Cloudflare 免费版域名下会触发 Error 1034 (Edge IP Restricted) 的受限/专用网段
+    // 1. 仅过滤真正不可用的受限/专用网段 (172.64.128.0/17、172.65/66、DNS/WARP 段)，放行 104.17.x.x 等主力段
     const p = String(ip).split(".").map(Number);
     if (
         p.length !== 4 ||
@@ -106,7 +106,6 @@ async function probeIP(ip) {
         p[0] === 0 ||
         (p[0] === 1 && (p[1] === 1 || p[1] === 0)) ||
         (p[0] === 172 && ((p[1] === 64 && p[2] >= 128) || p[1] === 65 || p[1] === 66)) ||
-        (p[0] === 104 && (p[1] === 17 || p[1] === 18)) ||
         (p[0] === 162 && p[1] === 159 && (p[2] === 36 || p[2] === 46 || (p[2] >= 192 && p[2] <= 199)))
     ) {
         log("跳过受限网段 " + ip);
@@ -116,7 +115,7 @@ async function probeIP(ip) {
     const validStatuses = [200, 204, 301, 302, 303, 307, 308, 400, 403];
 
     try {
-        // 2. 第一轮 HTTP 本地直连探测 (参考 ProxyHub_Emby：收到 200/403 等状态码均代表 CF 边缘节点已连通)
+        // 2. 第一轮 HTTP 本地直连探测 (收到 200/403 等状态码均代表 CF 边缘节点已连通)
         const t1 = Date.now();
         const res1 = await httpRequest("get", {
             url: "http://" + ip + "/cdn-cgi/trace",
@@ -134,7 +133,7 @@ async function probeIP(ip) {
             throw new Error("HTTP 响应异常 (状态 " + status1 + ", " + rtt1 + "ms)");
         }
 
-        // 从响应头 cf-ray 或响应体提取机房三字码 (如 HKG / SJC / LAX / NRT)
+        // 从响应头 cf-ray 或响应体提取机房三字码
         const respHeaders = res1.resp.headers || {};
         const cfRay = String(respHeaders["cf-ray"] || respHeaders["CF-RAY"] || respHeaders["Cf-Ray"] || "");
         const bodyText = String(res1.data || "");
@@ -189,12 +188,17 @@ async function probeIP(ip) {
             tlsRtt = elapsed;
         }
 
-        // 5. 计算综合评分：双轮 HTTP 均值 + 443 端口响应 + 抖动惩罚
+        // 5. 计算综合评分：对 104.16/17/19.x.x 等高带宽商业网段赋予 0.8 倍优选权重，优先保留 104.17.x.x 优质节点
         const avgHttp = Math.round((rtt1 + rtt2) / 2);
         const jitter = Math.abs(rtt2 - rtt1);
-        const score = Math.round(avgHttp * 0.5 + tlsRtt * 0.3 + jitter * 0.5);
+        const rawScore = avgHttp * 0.5 + tlsRtt * 0.3 + jitter * 0.5;
+        const isPremiumSegment = p[0] === 104 && (p[1] === 16 || p[1] === 17 || p[1] === 19);
+        const score = Math.round(isPremiumSegment ? rawScore * 0.8 : rawScore);
 
-        log("测速可达 " + ip + " [" + colo + "]: 评分 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)");
+        log(
+            "测速可达 " + ip + " [" + colo + "]" + (isPremiumSegment ? "[主力段]" : "") +
+            ": 评分 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)"
+        );
         return {
             ip: ip,
             colo: colo,
