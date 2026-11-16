@@ -5,7 +5,7 @@
 
 const args = ($argument && typeof $argument === "object") ? $argument : {};
 
-const ISP_TYPE = String(args.isp_type || "CM_移动");
+const ISP_TYPE = String(args.isp_type || "UOUIN");
 const TOP_COUNT = Math.max(1, Math.min(5, parseInt(args.ip_count || "3", 10) || 3));
 const ENABLE_PROBE = args.enable_probe === true || args.enable_probe === "true";
 const CF_TOKEN = String(args.cf_token || "").trim();
