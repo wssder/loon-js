@@ -99,23 +99,26 @@ function extractIPs(text) {
 async function probeIP(ip) {
     const start = Date.now();
     try {
-        // 参考 ProxyHub_Emby：直接 HTTPS 探测 IP，不覆盖 Host，不读取响应正文。
-        // Loon 收到任何 HTTP 状态码（包括 403）都代表 TCP/TLS/HTTP 已经连通；
-        // 只有请求层错误或超时才判定失败，模拟浏览器 no-cors fetch 的可达性判断。
+        // 使用 HTTP 80 端口直接探测 IP，规避纯 IP 无 SNI 导致的 Cloudflare TLS 握手失败报错；
+        // 禁用 auto-redirect 防止被 301/308 跳转到 HTTPS，收到任何有效 HTTP 状态码即代表连通。
         const result = await httpRequest("get", {
-            url: "https://" + ip + "/cdn-cgi/trace",
+            url: "http://" + ip + "/cdn-cgi/trace",
+            "auto-redirect": false,
             timeout: HTTP_TIMEOUT_PROBE
         });
 
         const latency = Date.now() - start;
         const status = Number(result.resp.status || result.resp.statusCode || 0);
-        log("测速可达 " + ip + ": HTTP " + status + "，RTT " + latency + " ms");
-        return {
-            ip: ip,
-            latency: latency,
-            ok: true,
-            httpStatus: status
-        };
+        if (status > 0) {
+            log("测速可达 " + ip + ": HTTP " + status + "，RTT " + latency + " ms");
+            return {
+                ip: ip,
+                latency: latency,
+                ok: true,
+                httpStatus: status
+            };
+        }
+        throw new Error("无效 HTTP 状态码: " + status);
     } catch (e) {
         log("测速失败 " + ip + ": " + String(e));
         return {
