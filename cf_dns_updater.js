@@ -21,7 +21,8 @@ const SOURCE_MAP = {
 };
 
 const HTTP_TIMEOUT_SOURCE = 15000;
-const HTTP_TIMEOUT_PROBE = 3000;
+const HTTP_TIMEOUT_PROBE = 7000;
+const PROBE_CONCURRENCY = 4;
 const HTTP_TIMEOUT_CF = 15000;
 
 function log(message) {
@@ -101,19 +102,25 @@ async function probeIP(ip) {
         const result = await httpRequest("get", {
             url: "http://" + ip + "/cdn-cgi/trace",
             headers: {
-                "Host": "speed.cloudflare.com"
+                "Host": "speed.cloudflare.com",
+                "User-Agent": "Mozilla/5.0 Loon-CF-DNS-Probe",
+                "Accept": "*/*",
+                "Connection": "close"
             },
             timeout: HTTP_TIMEOUT_PROBE
         });
 
         const status = Number(result.resp.status || result.resp.statusCode || 0);
-        if (status === 200 && String(result.data).indexOf("fl=") !== -1) {
+        const body = String(result.data || "");
+        if (status === 200 && /(?:^|\n)fl=/.test(body) && /(?:^|\n)colo=/.test(body)) {
             return {
                 ip: ip,
                 latency: Date.now() - start,
                 ok: true
             };
         }
+
+        log("测速无效响应 " + ip + ": HTTP " + status);
     } catch (e) {
         log("测速失败 " + ip + ": " + String(e));
     }
@@ -171,9 +178,22 @@ async function main() {
 
     if (ENABLE_PROBE) {
         log("开始本地测速");
-        const results = await Promise.all(candidateIPs.map(probeIP));
+        // 限制并发，避免一次性对大量 IP 发起请求导致手机端连接拥塞。
+        const results = [];
+        let nextIndex = 0;
+        const workerCount = Math.min(PROBE_CONCURRENCY, candidateIPs.length);
+
+        const workers = Array.from({ length: workerCount }, async () => {
+            while (nextIndex < candidateIPs.length) {
+                const current = nextIndex++;
+                results[current] = await probeIP(candidateIPs[current]);
+            }
+        });
+
+        await Promise.all(workers);
+
         const valid = results
-            .filter(r => r.ok)
+            .filter(r => r && r.ok)
             .sort((a, b) => a.latency - b.latency);
 
         selectedIPs = valid.slice(0, TOP_COUNT).map(r => r.ip);
