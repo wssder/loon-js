@@ -18,13 +18,7 @@ const ZONE_ID = String(args.zone_id || "").trim();
 const RECORD_NAME = String(args.record_name || "").trim();
 const CUSTOM_API = String(args.custom_api || "").trim();
 
-const SOURCE_MAP = {
-  "CFYes": "https://bestcf.tools12345.com/cfyes/ipv4.txt",
-  "Mia": "https://bestcf.tools12345.com/xinyitang3/ipv4.txt",
-  "WeTest": "https://bestcf.tools12345.com/wetest/ipv4.txt",
-  "UOUIN": "https://bestcf.tools12345.com/uouin/all.txt",
-  "Custom_自定义": CUSTOM_API
-};
+const SINGLE_SOURCE_URL = CUSTOM_API || "https://bestcf.tools12345.com/cmliu2/all.txt";
 
 const SOURCE_TIMEOUT = 10;
 const PROBE_TIMEOUT = 8;
@@ -137,7 +131,7 @@ async function main() {
     return;
   }
 
-  const sourceUrl = SOURCE_MAP[ISP_TYPE];
+  const sourceUrl = SINGLE_SOURCE_URL;
   if (!sourceUrl) {
     $notification.post("❌ CF 优选 DNS 线路错误", "未识别线路：" + ISP_TYPE, "请检查 LPX 与 JS 版本是否匹配");
     return;
@@ -147,7 +141,7 @@ async function main() {
     return;
   }
 
-  log("线路：" + ISP_TYPE);
+  log("线路：单源 Custom");
   log("优选数量：" + TOP_COUNT);
   log("本地测速：" + (ENABLE_PROBE ? "开启" : "关闭"));
   log("正在拉取 IP 数据源：" + sourceUrl);
