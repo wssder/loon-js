@@ -112,11 +112,25 @@ async function probeIP(ip) {
 
         const status = Number(result.resp.status || result.resp.statusCode || 0);
         const body = String(result.data || "");
+        // 200 且返回 Cloudflare trace 字段：完整响应验证通过。
         if (status === 200 && /(?:^|\n)fl=/.test(body) && /(?:^|\n)colo=/.test(body)) {
             return {
                 ip: ip,
                 latency: Date.now() - start,
                 ok: true
+            };
+        }
+
+        // 403 不是连接超时：说明目标 IP 已返回 HTTP 响应。
+        // 将其作为“可达”样本计入 RTT 排序，但不把它误认为 trace 验证成功。
+        if (status === 403) {
+            const latency = Date.now() - start;
+            log("测速可达 " + ip + ": HTTP 403，RTT " + latency + " ms");
+            return {
+                ip: ip,
+                latency: latency,
+                ok: true,
+                httpStatus: status
             };
         }
 
