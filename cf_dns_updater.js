@@ -1,175 +1,406 @@
 /**
- * Cloudflare 优选 IP 自动更新 DNS 脚本 (适配 Loon [Argument] 插件化)
+ * CF 优选 DNS 更新修复版
+ * Loon 专用
  */
 
-// 1. 读取用户在 Loon 插件 UI 界面设置的参数
-const args = typeof $argument === "object" ? $argument : {};
+const args = ($argument && typeof $argument === "object") ? $argument : {};
 
-const ISP_TYPE = args.isp_type || "CM_移动";
-const TOP_COUNT = parseInt(args.ip_count || "3", 10);
+const ISP_TYPE = String(args.isp_type || "CM_移动");
+const TOP_COUNT = Math.max(1, Math.min(5, parseInt(args.ip_count || "3", 10) || 3));
 const ENABLE_PROBE = args.enable_probe === true || args.enable_probe === "true";
-const CF_TOKEN = (args.cf_token || "").trim();
-const ZONE_ID = (args.zone_id || "").trim();
-const RECORD_NAME = (args.record_name || "").trim();
-const CUSTOM_API = (args.custom_api || "").trim();
+const CF_TOKEN = String(args.cf_token || "").trim();
+const ZONE_ID = String(args.zone_id || "").trim();
+const RECORD_NAME = String(args.record_name || "").trim();
+const CUSTOM_API = String(args.custom_api || "").trim();
 
-// 内置公开每日更新的 CM / 三网优选 IP 源（也可由用户在 UI 中自定义替换）
 const SOURCE_MAP = {
-    "CM_移动": CUSTOM_API || "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu",
-    "CT_电信": "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu",
-    "CU_联通": "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu",
-    "ALL_三网": "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu2",
+    "CFYes": "https://bestcf.tools12345.com/cfyes/ipv4.txt",
+    "Mia": "https://bestcf.tools12345.com/xinyitang3/ipv4.txt",
+    "WeTest": "https://bestcf.tools12345.com/wetest/ipv4.txt",
+    "UOUIN": "https://bestcf.tools12345.com/uouin/all.txt",
     "Custom_自定义": CUSTOM_API
 };
 
-function httpGet(options) {
-    return new Promise((resolve, reject) => {
-        $httpClient.get(options, (err, resp, data) => {
-            if (err) reject(err);
-            else resolve({ resp, data });
-        });
-    });
+const HTTP_TIMEOUT_SOURCE = 15000;
+const HTTP_TIMEOUT_PROBE = 3000;
+const HTTP_TIMEOUT_CF = 15000;
+
+function log(message) {
+    console.log("[CF-DNS] " + message);
+}
+
+function notify(title, subtitle, content) {
+    try {
+        $notification.post(title, subtitle || "", content || "");
+    } catch (e) {
+        log("通知失败: " + String(e));
+    }
 }
 
 function httpRequest(method, options) {
     return new Promise((resolve, reject) => {
-        $httpClient[method.toLowerCase()](options, (err, resp, data) => {
-            if (err) reject(err);
-            else resolve({ resp, data });
+        const fn = $httpClient[String(method).toLowerCase()];
+
+        if (typeof fn !== "function") {
+            reject(new Error("不支持 HTTP 方法: " + method));
+            return;
+        }
+
+        fn.call($httpClient, options, (err, resp, data) => {
+            if (err) {
+                reject(new Error(method.toUpperCase() + " 请求失败: " + String(err)));
+                return;
+            }
+
+            resolve({
+                resp: resp || {},
+                data: data == null ? "" : data
+            });
         });
     });
 }
 
-// 提取文本中的所有合法 IPv4 地址
-function extractIPs(text) {
-    const regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
-    const matches = text.match(regex) || [];
-    return [...new Set(matches)]; // 去重
+function parseJSON(text, label) {
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        throw new Error(label + " JSON 解析失败: " + String(e));
+    }
 }
 
-// 使用手机当前本地网络对候选 IP 进行 HTTP 响应测速（直连测试 Cloudflare trace 接口）
+function assertHTTP(result, label) {
+    const status = Number(
+        result.resp.status || result.resp.statusCode || 0
+    );
+
+    if (status < 200 || status >= 300) {
+        throw new Error(
+            label + " HTTP 状态异常: " + status +
+            "；响应: " + String(result.data).slice(0, 300)
+        );
+    }
+
+    return status;
+}
+
+function assertCloudflare(result, label) {
+    assertHTTP(result, label);
+
+    const json = parseJSON(result.data, label);
+
+    if (!json || json.success !== true) {
+        const errors = json && Array.isArray(json.errors)
+            ? json.errors.map(e =>
+                (e.code ? e.code + ": " : "") +
+                (e.message || JSON.stringify(e))
+            ).join(" | ")
+            : String(result.data).slice(0, 500);
+
+        throw new Error(label + "失败: " + errors);
+    }
+
+    return json;
+}
+
+function extractIPs(text) {
+    const regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
+
+    return [...new Set(
+        String(text || "").match(regex) || []
+    )];
+}
+
 async function probeIP(ip) {
     const start = Date.now();
+
     try {
-        const { resp, data } = await httpGet({
-            url: `http://${ip}/cdn-cgi/trace`,
-            headers: { "Host": "speed.cloudflare.com" },
-            timeout: 3
+        const result = await httpRequest("get", {
+            url: "http://" + ip + "/cdn-cgi/trace",
+            headers: {
+                "Host": "speed.cloudflare.com"
+            },
+            timeout: HTTP_TIMEOUT_PROBE
         });
-        if (resp && resp.status === 200 && data && data.includes("fl=")) {
-            const cost = Date.now() - start;
-            return { ip, latency: cost, ok: true };
+
+        const status = Number(
+            result.resp.status || result.resp.statusCode || 0
+        );
+
+        if (
+            status === 200 &&
+            String(result.data).indexOf("fl=") !== -1
+        ) {
+            return {
+                ip: ip,
+                latency: Date.now() - start,
+                ok: true
+            };
         }
-    } catch (e) {}
-    return { ip, latency: 9999, ok: false };
+
+    } catch (e) {
+        log("测速失败 " + ip + ": " + String(e));
+    }
+
+    return {
+        ip: ip,
+        latency: 99999,
+        ok: false
+    };
 }
 
 async function main() {
-    if (!CF_TOKEN || !ZONE_ID || !RECORD_NAME || RECORD_NAME === "emby.example.com") {
-        $notification.post("⚠️ CF 优选 DNS 插件未配置", "请进入插件详情页填写信息", "需填写 Cloudflare 令牌、Zone ID 与反代子域名");
-        $done();
-        return;
+
+    log("修复版启动");
+    log("线路: " + ISP_TYPE);
+    log("优选数量: " + TOP_COUNT);
+    log("本地测速: " + (ENABLE_PROBE ? "开启" : "关闭"));
+
+    if (!CF_TOKEN || !ZONE_ID || !RECORD_NAME) {
+        throw new Error(
+            "参数不完整，请检查 Token、Zone ID 和反代子域名"
+        );
     }
 
     const sourceUrl = SOURCE_MAP[ISP_TYPE] || CUSTOM_API;
-    console.log(`[CF-DNS] 正在从源拉取 IP: ${sourceUrl}`);
 
-    try {
-        // 1. 获取每日发布的候选 IP 列表
-        const { data } = await httpGet({ url: sourceUrl, timeout: 10 });
-        let candidateIPs = extractIPs(data);
+    if (!sourceUrl) {
+        throw new Error("IP 数据源地址为空");
+    }
 
-        if (candidateIPs.length === 0) {
-            $notification.post("❌ CF 优选 DNS 更新失败", "未能在源链接中解析出有效 IP", sourceUrl);
-            $done();
-            return;
+    log("正在拉取 IP 数据源: " + sourceUrl);
+
+    const sourceResult = await httpRequest("get", {
+        url: sourceUrl,
+        timeout: HTTP_TIMEOUT_SOURCE,
+        headers: {
+            "User-Agent": "Loon-CF-DNS-Updater/1.0"
         }
+    });
 
-        // 限制最大并发测试数量（取前 25 个候选 IP 防止超时）
-        candidateIPs = candidateIPs.slice(0, 25);
-        let selectedIPs = [];
+    const sourceStatus = assertHTTP(
+        sourceResult,
+        "IP 数据源"
+    );
 
-        // 2. 手机本地二次优选测速
-        if (ENABLE_PROBE) {
-            console.log(`[CF-DNS] 开始对 ${candidateIPs.length} 个候选 IP 进行本地测速...`);
-            const results = await Promise.all(candidateIPs.map(ip => probeIP(ip)));
-            const valid = results.filter(r => r.ok).sort((a, b) => a.latency - b.latency);
-            selectedIPs = valid.slice(0, TOP_COUNT).map(r => r.ip);
-            console.log(`[CF-DNS] 本地测速最优结果: ${JSON.stringify(valid.slice(0, TOP_COUNT))}`);
-        } else {
-            selectedIPs = candidateIPs.slice(0, TOP_COUNT);
-        }
+    const sourceText = String(sourceResult.data || "");
 
-        if (selectedIPs.length === 0) {
-            $notification.post("⚠️ CF 优选 DNS 未更新", "本地测速无合格 IP，保留原记录", "请检查当前网络或关闭本地二次测速");
-            $done();
-            return;
-        }
+    log("数据源 HTTP 状态: " + sourceStatus);
+    log("数据源响应长度: " + sourceText.length);
 
-        // 3. 查询 Cloudflare 现有同名 A 记录
-        const headers = {
-            "Authorization": `Bearer ${CF_TOKEN}`,
-            "Content-Type": "application/json"
-        };
-        const listUrl = `https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${RECORD_NAME}&type=A`;
-        const listRes = await httpGet({ url: listUrl, headers });
-        const listJson = JSON.parse(listRes.data);
+    if (!sourceText.trim()) {
+        throw new Error("IP 数据源返回空内容");
+    }
 
-        if (!listJson.success) {
-            $notification.post("❌ Cloudflare API 鉴权失败", "请检查 Token 或 Zone ID", listRes.data);
-            $done();
-            return;
-        }
+    let candidateIPs = extractIPs(sourceText);
 
-        const existing = listJson.result || [];
+    log("解析到候选 IPv4 数量: " + candidateIPs.length);
 
-        // 4. 依次更新或新建前 N 个优选 IP（关闭小黄云 proxied: false）
-        for (let i = 0; i < selectedIPs.length; i++) {
-            const ip = selectedIPs[i];
-            const payload = JSON.stringify({
-                type: "A",
-                name: RECORD_NAME,
-                content: ip,
-                ttl: 60,
-                proxied: false
+    if (candidateIPs.length === 0) {
+        throw new Error(
+            "没有解析到有效 IPv4: " +
+            sourceText.slice(0, 300)
+        );
+    }
+
+    candidateIPs = candidateIPs.slice(0, 25);
+
+    let selectedIPs = [];
+
+    if (ENABLE_PROBE) {
+
+        log("开始本地测速");
+
+        const results = await Promise.all(
+            candidateIPs.map(probeIP)
+        );
+
+        const valid = results
+            .filter(r => r.ok)
+            .sort((a, b) => a.latency - b.latency);
+
+        selectedIPs = valid
+            .slice(0, TOP_COUNT)
+            .map(r => r.ip);
+
+        log("测速成功数量: " + valid.length);
+
+        log(
+            "优选结果: " +
+            JSON.stringify(valid.slice(0, TOP_COUNT))
+        );
+
+    } else {
+
+        selectedIPs = candidateIPs.slice(0, TOP_COUNT);
+
+        log(
+            "关闭本地测速，选取: " +
+            selectedIPs.join(", ")
+        );
+    }
+
+    if (selectedIPs.length === 0) {
+        throw new Error(
+            "没有可用 IP，原 DNS 记录保持不变"
+        );
+    }
+
+    const headers = {
+        "Authorization": "Bearer " + CF_TOKEN,
+        "Content-Type": "application/json"
+    };
+
+    const listUrl =
+        "https://api.cloudflare.com/client/v4/zones/" +
+        encodeURIComponent(ZONE_ID) +
+        "/dns_records?type=A&name=" +
+        encodeURIComponent(RECORD_NAME) +
+        "&per_page=100";
+
+    log("正在查询 Cloudflare DNS 记录");
+
+    const listResult = await httpRequest("get", {
+        url: listUrl,
+        headers: headers,
+        timeout: HTTP_TIMEOUT_CF
+    });
+
+    const listJson = assertCloudflare(
+        listResult,
+        "查询 DNS 记录"
+    );
+
+    const existing = Array.isArray(listJson.result)
+        ? listJson.result
+        : [];
+
+    log("现有 A 记录数量: " + existing.length);
+
+    // 先更新或新增记录
+    // 所有写入成功之后才清理旧记录
+
+    for (let i = 0; i < selectedIPs.length; i++) {
+
+        const ip = selectedIPs[i];
+
+        const payload = JSON.stringify({
+            type: "A",
+            name: RECORD_NAME,
+            content: ip,
+            ttl: 60,
+            proxied: false
+        });
+
+        if (i < existing.length) {
+
+            const recId = existing[i].id;
+
+            log("更新 A 记录: " + ip);
+
+            const updateResult = await httpRequest("put", {
+                url:
+                    "https://api.cloudflare.com/client/v4/zones/" +
+                    encodeURIComponent(ZONE_ID) +
+                    "/dns_records/" +
+                    encodeURIComponent(recId),
+
+                headers: headers,
+                body: payload,
+                timeout: HTTP_TIMEOUT_CF
             });
 
-            if (i < existing.length) {
-                const recId = existing[i].id;
-                await httpRequest("put", {
-                    url: `https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${recId}`,
-                    headers,
-                    body: payload
-                });
-            } else {
-                await httpRequest("post", {
-                    url: `https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records`,
-                    headers,
-                    body: payload
-                });
-            }
+            assertCloudflare(
+                updateResult,
+                "更新 A 记录 " + ip
+            );
+
+        } else {
+
+            log("新增 A 记录: " + ip);
+
+            const createResult = await httpRequest("post", {
+                url:
+                    "https://api.cloudflare.com/client/v4/zones/" +
+                    encodeURIComponent(ZONE_ID) +
+                    "/dns_records",
+
+                headers: headers,
+                body: payload,
+                timeout: HTTP_TIMEOUT_CF
+            });
+
+            assertCloudflare(
+                createResult,
+                "新增 A 记录 " + ip
+            );
         }
 
-        // 5. 清理多余的旧 A 记录
-        if (existing.length > selectedIPs.length) {
-            for (let i = selectedIPs.length; i < existing.length; i++) {
-                await httpRequest("delete", {
-                    url: `https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${existing[i].id}`,
-                    headers
-                });
-            }
-        }
-
-        $notification.post(
-            "🎉 CF 优选 DNS 更新成功",
-            `域名: ${RECORD_NAME} (${ISP_TYPE})`,
-            `已替换 ${selectedIPs.length} 个优选 IP: ${selectedIPs.join(", ")}`
-        );
-    } catch (err) {
-        $notification.post("❌ CF 优选脚本运行异常", String(err), "");
-    } finally {
-        $done();
+        log("第 " + (i + 1) + " 条记录写入成功");
     }
+
+    // 写入成功后清理多余记录
+
+    if (existing.length > selectedIPs.length) {
+
+        for (
+            let i = selectedIPs.length;
+            i < existing.length;
+            i++
+        ) {
+
+            const recId = existing[i].id;
+
+            log("清理多余记录: " + recId);
+
+            const deleteResult = await httpRequest("delete", {
+                url:
+                    "https://api.cloudflare.com/client/v4/zones/" +
+                    encodeURIComponent(ZONE_ID) +
+                    "/dns_records/" +
+                    encodeURIComponent(recId),
+
+                headers: headers,
+                timeout: HTTP_TIMEOUT_CF
+            });
+
+            assertCloudflare(
+                deleteResult,
+                "删除多余记录 " + recId
+            );
+        }
+    }
+
+    const summary =
+        "域名: " + RECORD_NAME +
+        "\n线路: " + ISP_TYPE +
+        "\n更新 IP: " + selectedIPs.join(", ");
+
+    log("全部更新完成");
+
+    notify(
+        "🎉 CF 优选 DNS 更新成功",
+        "成功写入 " + selectedIPs.length + " 条 A 记录",
+        summary
+    );
 }
 
-main();
+main()
+    .catch(err => {
+
+        const message =
+            err && err.message
+                ? err.message
+                : String(err);
+
+        log("运行失败: " + message);
+
+        notify(
+            "❌ CF 优选 DNS 更新失败",
+            message,
+            "请查看 Loon 运行日志"
+        );
+
+    })
+    .finally(() => {
+        $done();
+    });
