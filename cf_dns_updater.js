@@ -3,10 +3,36 @@
  * Loon 专用
  */
 
-const args = ($argument && typeof $argument === "object") ? $argument : {};
+function log(message) {
+    console.log("[CF-DNS] " + message);
+}
+
+function notify(title, subtitle, content) {
+    try {
+        $notification.post(title, subtitle || "", content || "");
+    } catch (e) {
+        log("通知失败: " + String(e));
+    }
+}
+
+// 解析参数，兼容对象和 JSON 字符串
+let args = {};
+try {
+    if (typeof $argument === "string" && $argument.trim()) {
+        args = JSON.parse($argument);
+    } else if ($argument && typeof $argument === "object") {
+        args = $argument;
+    }
+} catch (e) {
+    log("参数解析失败，使用空参数: " + String(e));
+    args = {};
+}
+
 const ISP_TYPE = String(args.isp_type || "UOUIN");
 const TOP_COUNT = Math.max(1, Math.min(5, parseInt(args.ip_count || "3", 10) || 3));
 const ENABLE_PROBE = args.enable_probe === true || args.enable_probe === "true";
+const ENABLE_HTTPS_CHECK = args.enable_https_check === true || args.enable_https_check === "true";
+const PROBE_SHUFFLE = args.probe_shuffle === true || args.probe_shuffle === "true";
 const CF_TOKEN = String(args.cf_token || "").trim();
 const ZONE_ID = String(args.zone_id || "").trim();
 const RECORD_NAME = String(args.record_name || "").trim();
@@ -24,18 +50,7 @@ const HTTP_TIMEOUT_SOURCE = 15000;
 const HTTP_TIMEOUT_PROBE = 2000;
 const PROBE_CONCURRENCY = 4;
 const HTTP_TIMEOUT_CF = 15000;
-
-function log(message) {
-    console.log("[CF-DNS] " + message);
-}
-
-function notify(title, subtitle, content) {
-    try {
-        $notification.post(title, subtitle || "", content || "");
-    } catch (e) {
-        log("通知失败: " + String(e));
-    }
-}
+const MAX_PROBE = Math.max(1, parseInt(args.max_probe || "200", 10) || 200);
 
 function httpRequest(method, options) {
     return new Promise((resolve, reject) => {
@@ -96,18 +111,42 @@ function extractIPs(text) {
     return [...new Set(String(text || "").match(regex) || [])];
 }
 
-async function probeIP(ip) {
-    // 1. 仅过滤真正不可用的受限/专用网段 (172.64.128.0/17、172.65/66、DNS/WARP 段)，放行 104.17.x.x 等主力段
+function isIPAllowed(ip) {
     const p = String(ip).split(".").map(Number);
     if (
         p.length !== 4 ||
-        p.some(n => isNaN(n) || n < 0 || n > 255) ||
-        p[0] === 127 ||
-        p[0] === 0 ||
-        (p[0] === 1 && (p[1] === 1 || p[1] === 0)) ||
-        (p[0] === 172 && ((p[1] === 64 && p[2] >= 128) || p[1] === 65 || p[1] === 66)) ||
-        (p[0] === 162 && p[1] === 159 && (p[2] === 36 || p[2] === 46 || (p[2] >= 192 && p[2] <= 199)))
+        p.some(n => !Number.isInteger(n) || n < 0 || n > 255)
     ) {
+        return false;
+    }
+
+    // 常见非公网/保留地址
+    if (p[0] === 0 || p[0] === 10 || p[0] === 127) return false;
+    if (p[0] === 169 && p[1] === 254) return false;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return false;
+    if (p[0] === 192 && p[1] === 168) return false;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return false;
+    if (p[0] === 198 && (p[1] === 18 || p[1] === 19)) return false;
+
+    // Cloudflare 免费版域名下会触发 Error 1034 的受限网段
+    if (p[0] === 1 && (p[1] === 1 || p[1] === 0)) return false;
+    if (p[0] === 172 && ((p[1] === 64 && p[2] >= 128) || p[1] === 65 || p[1] === 66)) return false;
+    if (p[0] === 104 && (p[1] === 17 || p[1] === 18)) return false;
+    if (p[0] === 162 && p[1] === 159 && (p[2] === 36 || p[2] === 46 || (p[2] >= 192 && p[2] <= 199))) return false;
+
+    return true;
+}
+
+function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+async function probeIP(ip) {
+    if (!isIPAllowed(ip)) {
         log("跳过受限网段 " + ip);
         return { ip: ip, latency: 99999, ok: false };
     }
@@ -115,7 +154,7 @@ async function probeIP(ip) {
     const validStatuses = [200, 204, 301, 302, 303, 307, 308, 400, 403];
 
     try {
-        // 2. 第一轮 HTTP 本地直连探测 (收到 200/403 等状态码均代表 CF 边缘节点已连通)
+        // 第一轮 HTTP 本地直连探测
         const t1 = Date.now();
         const res1 = await httpRequest("get", {
             url: "http://" + ip + "/cdn-cgi/trace",
@@ -141,7 +180,7 @@ async function probeIP(ip) {
         const coloMatch = bodyText.match(/colo=([A-Z]{3})/);
         const colo = (rayMatch ? rayMatch[1] : (coloMatch ? coloMatch[1] : "CF")).toUpperCase();
 
-        // 3. 第二轮 HTTP 复测：确保 0 丢包并计算网络抖动 (Jitter)
+        // 第二轮 HTTP 复测
         const t2 = Date.now();
         const res2 = await httpRequest("get", {
             url: "http://" + ip + "/cdn-cgi/trace",
@@ -159,46 +198,45 @@ async function probeIP(ip) {
             throw new Error("二次复测丢包 (状态 " + status2 + ")");
         }
 
-        // 4. 第三轮 443 端口 (HTTPS) 可达性验证：确保运营商未阻断该 IP 的 443 端口
-        const t3 = Date.now();
+        // 第三轮 443 端口可达性验证，默认关闭
         let tlsRtt = 0;
-        try {
-            const res3 = await httpRequest("get", {
-                url: "https://" + ip + "/cdn-cgi/trace",
-                node: "DIRECT",
-                "auto-redirect": false,
-                insecure: true,
-                timeout: HTTP_TIMEOUT_PROBE
-            });
-            const status3 = Number(res3.resp.status || res3.resp.statusCode || 0);
-            if (status3 <= 0) {
-                throw new Error("HTTPS 状态无效");
+        if (ENABLE_HTTPS_CHECK) {
+            const t3 = Date.now();
+            try {
+                const res3 = await httpRequest("get", {
+                    url: "https://" + ip + "/cdn-cgi/trace",
+                    node: "DIRECT",
+                    "auto-redirect": false,
+                    insecure: true,
+                    timeout: HTTP_TIMEOUT_PROBE
+                });
+                const status3 = Number(res3.resp.status || res3.resp.statusCode || 0);
+                if (status3 <= 0) {
+                    throw new Error("HTTPS 状态无效");
+                }
+                tlsRtt = Date.now() - t3;
+            } catch (tlsErr) {
+                const elapsed = Date.now() - t3;
+                const errMsg = String(tlsErr && tlsErr.message ? tlsErr.message : tlsErr);
+                const isPort443Alive =
+                    /handshake failure|0A000410|reason:1040/i.test(errMsg) &&
+                    /errno:0\b/.test(errMsg) &&
+                    elapsed < HTTP_TIMEOUT_PROBE;
+                if (!isPort443Alive) {
+                    throw new Error("443 端口不通或超时");
+                }
+                tlsRtt = elapsed;
             }
-            tlsRtt = Date.now() - t3;
-        } catch (tlsErr) {
-            const elapsed = Date.now() - t3;
-            const errMsg = String(tlsErr && tlsErr.message ? tlsErr.message : tlsErr);
-            const isPort443Alive =
-                /handshake failure|0A000410|reason:1040/i.test(errMsg) &&
-                /errno:0\b/.test(errMsg) &&
-                elapsed < HTTP_TIMEOUT_PROBE;
-            if (!isPort443Alive) {
-                throw new Error("443 端口不通或超时");
-            }
-            tlsRtt = elapsed;
         }
 
-        // 5. 计算综合评分：对 104.16/17/19.x.x 等高带宽商业网段赋予 0.8 倍优选权重，优先保留 104.17.x.x 优质节点
+        // 综合评分
         const avgHttp = Math.round((rtt1 + rtt2) / 2);
         const jitter = Math.abs(rtt2 - rtt1);
-        const rawScore = avgHttp * 0.5 + tlsRtt * 0.3 + jitter * 0.5;
-        const isPremiumSegment = p[0] === 104 && (p[1] === 16 || p[1] === 17 || p[1] === 19);
-        const score = Math.round(isPremiumSegment ? rawScore * 0.8 : rawScore);
+        const score = ENABLE_HTTPS_CHECK
+            ? Math.round(avgHttp * 0.5 + tlsRtt * 0.3 + jitter * 0.5)
+            : Math.round(avgHttp * 0.5 + jitter * 0.5);
 
-        log(
-            "测速可达 " + ip + " [" + colo + "]" + (isPremiumSegment ? "[主力段]" : "") +
-            ": 评分 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)"
-        );
+        log("测速可达 " + ip + " [" + colo + "]: 评分 " + score + "ms (HTTP " + avgHttp + "ms / 443端口 " + tlsRtt + "ms / 抖动 " + jitter + "ms)");
         return {
             ip: ip,
             colo: colo,
@@ -219,14 +257,54 @@ async function probeIP(ip) {
     }
 }
 
+async function listAllRecords(headers) {
+    let page = 1;
+    const all = [];
+
+    while (true) {
+        const res = await httpRequest("get", {
+            url:
+                "https://api.cloudflare.com/client/v4/zones/" +
+                encodeURIComponent(ZONE_ID) +
+                "/dns_records?type=A&name=" +
+                encodeURIComponent(RECORD_NAME) +
+                "&per_page=100&page=" +
+                page,
+            headers: headers,
+            timeout: HTTP_TIMEOUT_CF
+        });
+
+        const json = assertCloudflare(res, "查询 DNS 记录");
+        const batch = Array.isArray(json.result) ? json.result : [];
+        all.push(...batch);
+
+        const totalPages =
+            json.result_info && json.result_info.total_pages
+                ? json.result_info.total_pages
+                : 1;
+
+        if (page >= totalPages || batch.length === 0) break;
+        page++;
+    }
+
+    return all;
+}
+
 async function main() {
     log("修复版启动");
     log("线路: " + ISP_TYPE);
     log("优选数量: " + TOP_COUNT);
     log("本地测速: " + (ENABLE_PROBE ? "开启" : "关闭"));
+    log("443 端口验证: " + (ENABLE_HTTPS_CHECK ? "开启" : "关闭"));
+    log("最大测速数量: " + MAX_PROBE);
+    log("测速打乱: " + (PROBE_SHUFFLE ? "开启" : "关闭"));
 
     if (!CF_TOKEN || !ZONE_ID || !RECORD_NAME) {
         throw new Error("参数不完整，请检查 Token、Zone ID 和反代子域名");
+    }
+
+    if (!SOURCE_MAP[ISP_TYPE] && !CUSTOM_API) {
+        throw new Error("未知的 isp_type: " + ISP_TYPE + "，且未提供 custom_api");
     }
 
     const sourceUrl = SOURCE_MAP[ISP_TYPE] || CUSTOM_API;
@@ -253,27 +331,34 @@ async function main() {
         throw new Error("IP 数据源返回空内容");
     }
 
-    let candidateIPs = extractIPs(sourceText);
-    log("解析到候选 IPv4 数量: " + candidateIPs.length);
+    let candidateIPs = extractIPs(sourceText).filter(isIPAllowed);
+    log("解析到有效候选 IPv4 数量: " + candidateIPs.length);
 
     if (candidateIPs.length === 0) {
         throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
     }
 
-    // 全量测速：不再截断候选列表，所有解析到的 IPv4 都参与测速。
     let selectedIPs = [];
 
     if (ENABLE_PROBE) {
         log("开始本地测速");
-        // 限制并发，避免一次性对大量 IP 发起请求导致手机端连接拥塞。
+
+        let probeTargets = candidateIPs.slice();
+        if (PROBE_SHUFFLE) {
+            shuffleArray(probeTargets);
+        }
+        probeTargets = probeTargets.slice(0, Math.min(MAX_PROBE, probeTargets.length));
+
+        log("本轮参与测速 IP 数量: " + probeTargets.length);
+
         const results = [];
         let nextIndex = 0;
-        const workerCount = Math.min(PROBE_CONCURRENCY, candidateIPs.length);
+        const workerCount = Math.min(PROBE_CONCURRENCY, probeTargets.length);
 
         const workers = Array.from({ length: workerCount }, async () => {
-            while (nextIndex < candidateIPs.length) {
+            while (nextIndex < probeTargets.length) {
                 const current = nextIndex++;
-                results[current] = await probeIP(candidateIPs[current]);
+                results[current] = await probeIP(probeTargets[current]);
             }
         });
 
@@ -300,25 +385,11 @@ async function main() {
         "Content-Type": "application/json"
     };
 
-    const listUrl =
-        "https://api.cloudflare.com/client/v4/zones/" +
-        encodeURIComponent(ZONE_ID) +
-        "/dns_records?type=A&name=" +
-        encodeURIComponent(RECORD_NAME) +
-        "&per_page=100";
-
     log("正在查询 Cloudflare DNS 记录");
-    const listResult = await httpRequest("get", {
-        url: listUrl,
-        headers: headers,
-        timeout: HTTP_TIMEOUT_CF
-    });
-
-    const listJson = assertCloudflare(listResult, "查询 DNS 记录");
-    const existing = Array.isArray(listJson.result) ? listJson.result : [];
+    const existing = await listAllRecords(headers);
     log("现有 A 记录数量: " + existing.length);
 
-    // 先更新或新增记录；全部写入成功后才清理旧记录。
+    // 先更新或新增记录；全部写入成功后才清理旧记录
     for (let i = 0; i < selectedIPs.length; i++) {
         const ip = selectedIPs[i];
         const payload = JSON.stringify({
@@ -333,7 +404,7 @@ async function main() {
             const recId = existing[i].id;
             log("更新 A 记录: " + ip);
 
-            const updateResult = await httpRequest("put", {
+            const updateResult = await httpRequest("patch", {
                 url:
                     "https://api.cloudflare.com/client/v4/zones/" +
                     encodeURIComponent(ZONE_ID) +
