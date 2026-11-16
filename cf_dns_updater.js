@@ -111,12 +111,11 @@ async function probeIP(ip) {
             latency: 9999,
             rawLatency: Math.round(Date.now() - start),
             statusText: "超时 (>2000ms)",
-            ok: false,
-            tier: 9
+            ok: false
         };
     };
 
-    const processResult = (httpStatus, tier) => {
+    const processResult = (httpStatus) => {
         const rawLatency = Math.round(Date.now() - start);
         if (rawLatency > HTTP_TIMEOUT_PROBE) {
             return markTimeout("超时 (>2000ms)");
@@ -141,16 +140,16 @@ async function probeIP(ip) {
             rawLatency: rawLatency,
             statusText: statusText,
             ok: true,
-            httpStatus: httpStatus || 0,
-            tier: tier || 1
+            httpStatus: httpStatus || 0
         };
     };
 
     try {
-        // 严格对齐 worker.js 的 doLocalPing：
-        // 1. 强制走 DIRECT 本地直连探测 https://${ip}/cdn-cgi/trace，避免被 Loon 分流规则代理导致死节点误判可达；
-        // 2. 使用 2000ms 定时器模拟 AbortController 超时控制；
-        // 3. 非 AbortError 超时的响应（含无 SNI 下的 TLS 握手响应或 HTTP 状态码）只要在 2000ms 内返回且非连接拒绝/网络不可达，均进入 processResult 计算预估延迟。
+        // 1:1 还原 worker.js 的 doLocalPing 逻辑：
+        // 1. 探测 https://${ip}/cdn-cgi/trace，指定 node: "DIRECT" 保证本地直连测速；
+        // 2. 2000ms 定时器对应 worker.js 的 AbortController (setTimeout(() => controller.abort(), 2000))；
+        // 3. 在 worker.js 中：catch (err) { if (err.name === 'AbortError') markTimeout(...); else processResult(); }
+        //    即对裸 IP 发起 HTTPS 请求触发的 SSL/TLS 握手报错（非超时、非 TCP 拒绝/不可达）同样进入 processResult 计算延迟。
         const result = await new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 if (settled) return;
@@ -185,7 +184,7 @@ async function probeIP(ip) {
         });
 
         const status = Number(result.resp.status || result.resp.statusCode || 0);
-        return processResult(status, 1);
+        return processResult(status);
     } catch (err) {
         const rawLatency = Math.round(Date.now() - start);
         const errMsg = String(err && err.message ? err.message : err);
@@ -200,7 +199,7 @@ async function probeIP(ip) {
         if (isAbortOrTimeout || isTcpConnectFail) {
             return markTimeout(isAbortOrTimeout ? "超时 (>2000ms)" : errMsg);
         }
-        return processResult(0, 2);
+        return processResult(0);
     }
 }
 
@@ -245,125 +244,32 @@ async function main() {
         throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
     }
 
-    // 对齐 worker.js (ProxyHub_Emby) 本地测速逻辑并持续重试，直至优选到符合要求的 2 个节点。
+    // 全量测速：不再截断候选列表，所有解析到的 IPv4 都参与测速。
     let selectedIPs = [];
 
     if (ENABLE_PROBE) {
-        log("开始本地测速 (worker.js doLocalPing 标准)");
-        const targetPair = ["104.17.134.88", "104.17.138.66"];
-        let hasTargetPairInSource = targetPair.every(ip => candidateIPs.includes(ip));
-        const maxRetryRounds = 10;
-        const bestMap = new Map();
-        let round = 0;
+        log("开始本地测速");
+        // 限制并发，避免一次性对大量 IP 发起请求导致手机端连接拥塞。
+        const results = [];
+        let nextIndex = 0;
+        const workerCount = Math.min(PROBE_CONCURRENCY, candidateIPs.length);
 
-        while (round < maxRetryRounds) {
-            round++;
-            if (round > 1 && !hasTargetPairInSource && bestMap.size < 2) {
-                try {
-                    const retrySource = await httpRequest("get", {
-                        url: sourceUrl,
-                        timeout: HTTP_TIMEOUT_SOURCE,
-                        headers: {
-                            "User-Agent": "Loon-CF-DNS-Updater/1.0"
-                        }
-                    });
-                    const moreIPs = extractIPs(retrySource.data || "");
-                    if (moreIPs.length > 0) {
-                        candidateIPs = [...new Set([...candidateIPs, ...moreIPs])];
-                        hasTargetPairInSource = targetPair.every(ip => candidateIPs.includes(ip));
-                    }
-                } catch (_) {}
+        const workers = Array.from({ length: workerCount }, async () => {
+            while (nextIndex < candidateIPs.length) {
+                const current = nextIndex++;
+                results[current] = await probeIP(candidateIPs[current]);
             }
+        });
 
-            const pendingIPs = round === 1
-                ? candidateIPs
-                : (hasTargetPairInSource
-                    ? targetPair.filter(ip => !bestMap.has(ip))
-                    : candidateIPs.filter(ip => !bestMap.has(ip)));
+        await Promise.all(workers);
 
-            if (pendingIPs.length === 0) {
-                break;
-            }
+        const valid = results
+            .filter(r => r && r.ok)
+            .sort((a, b) => a.latency - b.latency);
 
-            log("第 " + round + " 轮测速开始，待测节点数: " + pendingIPs.length);
-            const roundResults = [];
-            let nextIndex = 0;
-            // 采用与 worker.js 一致的高并发批量探测，避免低并发串行等待超时节点耗尽脚本执行时间
-            const concurrency = Math.min(Math.max(PROBE_CONCURRENCY, 24), pendingIPs.length);
-
-            const workers = Array.from({ length: concurrency }, async () => {
-                while (nextIndex < pendingIPs.length) {
-                    const current = nextIndex++;
-                    roundResults[current] = await probeIP(pendingIPs[current]);
-                }
-            });
-
-            await Promise.all(workers);
-
-            for (const r of roundResults) {
-                if (r && r.ok && r.latency < HTTP_TIMEOUT_PROBE) {
-                    const prev = bestMap.get(r.ip);
-                    if (!prev || r.tier < prev.tier || (r.tier === prev.tier && r.latency < prev.latency)) {
-                        bestMap.set(r.ip, r);
-                    }
-                }
-            }
-
-            if (hasTargetPairInSource) {
-                const matchedTargets = targetPair
-                    .map(ip => bestMap.get(ip))
-                    .filter(r => r && r.ok && r.latency < 300);
-
-                if (matchedTargets.length === targetPair.length) {
-                    matchedTargets.sort((a, b) => a.latency - b.latency);
-                    selectedIPs = matchedTargets.map(r => r.ip);
-                    log("第 " + round + " 轮成功优选到目标 2 IP: " + JSON.stringify(matchedTargets));
-                    break;
-                }
-                log(
-                    "第 " + round + " 轮测速命中目标节点 " +
-                    matchedTargets.length + "/" + targetPair.length + "，继续重试..."
-                );
-            } else {
-                const validNow = Array.from(bestMap.values())
-                    .filter(r => r && r.ok && r.latency < HTTP_TIMEOUT_PROBE)
-                    .sort((a, b) => (a.tier - b.tier) || (a.latency - b.latency));
-                const excellentNow = validNow.filter(r => r.latency < 300);
-                const needCount = Math.min(2, TOP_COUNT, candidateIPs.length);
-
-                if (excellentNow.length >= needCount) {
-                    const chosen = excellentNow.slice(0, Math.min(2, TOP_COUNT));
-                    selectedIPs = chosen.map(r => r.ip);
-                    log("第 " + round + " 轮测速达标，优选结果: " + JSON.stringify(chosen));
-                    break;
-                }
-                log(
-                    "第 " + round + " 轮测速极佳节点数 " +
-                    excellentNow.length + "/" + needCount + "，继续重试..."
-                );
-            }
-        }
-
-        if (selectedIPs.length === 0) {
-            if (hasTargetPairInSource) {
-                const matchedTargets = targetPair
-                    .map(ip => bestMap.get(ip))
-                    .filter(r => r && r.ok)
-                    .sort((a, b) => a.latency - b.latency);
-                if (matchedTargets.length > 0) {
-                    selectedIPs = matchedTargets.map(r => r.ip);
-                }
-            }
-            if (selectedIPs.length === 0) {
-                const validAll = Array.from(bestMap.values())
-                    .filter(r => r && r.ok)
-                    .sort((a, b) => (a.tier - b.tier) || (a.latency - b.latency));
-                selectedIPs = validAll.slice(0, Math.min(2, TOP_COUNT)).map(r => r.ip);
-            }
-        }
-
-        log("测速成功数量: " + bestMap.size);
-        log("最终优选结果: " + selectedIPs.join(", "));
+        selectedIPs = valid.slice(0, TOP_COUNT).map(r => r.ip);
+        log("测速成功数量: " + valid.length);
+        log("优选结果: " + JSON.stringify(valid.slice(0, TOP_COUNT)));
     } else {
         selectedIPs = candidateIPs.slice(0, TOP_COUNT);
         log("关闭本地测速，选取: " + selectedIPs.join(", "));
