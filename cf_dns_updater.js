@@ -173,7 +173,7 @@ async function main() {
         throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
     }
 
-    candidateIPs = candidateIPs.slice(0, 25);
+    // 全量测速：不再截断候选列表，所有解析到的 IPv4 都参与测速。
     let selectedIPs = [];
 
     if (ENABLE_PROBE) {
