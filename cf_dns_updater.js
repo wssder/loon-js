@@ -21,7 +21,7 @@ const SOURCE_MAP = {
 };
 
 const HTTP_TIMEOUT_SOURCE = 15000;
-const HTTP_TIMEOUT_PROBE = 7000;
+const HTTP_TIMEOUT_PROBE = 2000;
 const PROBE_CONCURRENCY = 4;
 const HTTP_TIMEOUT_CF = 15000;
 
@@ -99,51 +99,31 @@ function extractIPs(text) {
 async function probeIP(ip) {
     const start = Date.now();
     try {
+        // 参考 ProxyHub_Emby：直接 HTTPS 探测 IP，不覆盖 Host，不读取响应正文。
+        // Loon 收到任何 HTTP 状态码（包括 403）都代表 TCP/TLS/HTTP 已经连通；
+        // 只有请求层错误或超时才判定失败，模拟浏览器 no-cors fetch 的可达性判断。
         const result = await httpRequest("get", {
-            url: "http://" + ip + "/cdn-cgi/trace",
-            headers: {
-                "Host": "speed.cloudflare.com",
-                "User-Agent": "Mozilla/5.0 Loon-CF-DNS-Probe",
-                "Accept": "*/*",
-                "Connection": "close"
-            },
+            url: "https://" + ip + "/cdn-cgi/trace",
             timeout: HTTP_TIMEOUT_PROBE
         });
 
+        const latency = Date.now() - start;
         const status = Number(result.resp.status || result.resp.statusCode || 0);
-        const body = String(result.data || "");
-        // 200 且返回 Cloudflare trace 字段：完整响应验证通过。
-        if (status === 200 && /(?:^|\n)fl=/.test(body) && /(?:^|\n)colo=/.test(body)) {
-            return {
-                ip: ip,
-                latency: Date.now() - start,
-                ok: true
-            };
-        }
-
-        // 403 不是连接超时：说明目标 IP 已返回 HTTP 响应。
-        // 将其作为“可达”样本计入 RTT 排序，但不把它误认为 trace 验证成功。
-        if (status === 403) {
-            const latency = Date.now() - start;
-            log("测速可达 " + ip + ": HTTP 403，RTT " + latency + " ms");
-            return {
-                ip: ip,
-                latency: latency,
-                ok: true,
-                httpStatus: status
-            };
-        }
-
-        log("测速无效响应 " + ip + ": HTTP " + status);
+        log("测速可达 " + ip + ": HTTP " + status + "，RTT " + latency + " ms");
+        return {
+            ip: ip,
+            latency: latency,
+            ok: true,
+            httpStatus: status
+        };
     } catch (e) {
         log("测速失败 " + ip + ": " + String(e));
+        return {
+            ip: ip,
+            latency: 99999,
+            ok: false
+        };
     }
-
-    return {
-        ip: ip,
-        latency: 99999,
-        ok: false
-    };
 }
 
 async function main() {
