@@ -1,28 +1,20 @@
-#!name = Cloudflare 优选 IP 自动换源
-#!desc = 自动拉取 CM 每日优选反代 IP，支持手机本地二次测速筛选，并自动替换 Cloudflare DNS A 记录，助力 Emby 满速播放。
+#!name = CF 优选 DNS 多源版（测速修复）
+#!desc = 多源拉取 Cloudflare 优选 IPv4，手机本地并发测速，选取最快 IP 更新 Cloudflare DNS；测速失败保留原记录。
 #!author = @wssder
 #!homepage = https://github.com/wssder/loon-js
-#!date = 2026-11-16 08:45:00
-#!system = iOS, iPadOS, macOS, watchOS
-#!system_version = 18
-#!loon_version = 3.5.1(998)
+#!date = 2026-11-16
+#!system = iOS, iPadOS, macOS
+#!loon_version = 3.5.1
 
 [Argument]
-isp_type = select, "CM_移动", "CT_电信", "CU_联通", "ALL_三网", "Custom_自定义", tag = [优选源]运营商线路, desc = 选择对应运营商的每日优选 IP 库，或选择自定义源。
-
-ip_count = select, "3", "1", "2", "5", tag = [DNS]替换 IP 数量, desc = 挑选前几个最优 IP 写入 Cloudflare 同名 A 记录实现轮询负载均衡。
-
-enable_probe = switch, true, tag = [本地优选]手机端二次测速, desc = 开启后将通过当前手机网络对候选 IP 进行并发连接测速，挑出本地真正最快的节点。
-
-cf_token = input, "", tag = [API]Cloudflare 令牌, desc = 必填：填入具有 Zone.DNS 编辑权限的 API Token。
-
-zone_id = input, "", tag = [API]域名 Zone ID, desc = 必填：在 Cloudflare 域名概述页面右下角获取。
-
-record_name = input, "emby.example.com", tag = [DNS]反代子域名, desc = 必填：需要自动替换优选 IP 的完整域名。
-
-custom_api = input, "https://raw.githubusercontent.com/free-nodes/bestcf/main/cmliu", tag = [高级]自定义 IP 源链接, desc = 当优选源选择 Custom 或默认拉取 CM 库时使用的在线文本/API 地址（每行一个 IP）。
-
-cron_exp = input, "0 4 * * *", tag = [定时]Cron 表达式, desc = 默认每天凌晨 4 点自动执行一次优选与 DNS 更新。
+isp_type = select, "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 选择优选 IP 数据源。
+ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取最快的前 N 个 IP。
+enable_probe = switch, true, tag = [测速]手机本地二次测速, desc = 开启后使用当前网络对候选 IP 并发测速；关闭则直接取数据源前 N 个 IP。
+cf_token = input, "", tag = [Cloudflare]API Token, desc = 需要具有 Zone DNS 编辑权限。
+zone_id = input, "", tag = [Cloudflare]Zone ID, desc = Cloudflare 域名 Zone ID。
+record_name = input, "", tag = [DNS]域名, desc = 需要更新的完整 DNS 主机名。
+custom_api = input, "", tag = [高级]自定义 API, desc = 选择 Custom_自定义 时使用；每行一个 IPv4 地址或包含 IPv4 的文本。
+cron_exp = input, "0 4 * * *", tag = [定时]Cron, desc = 默认每天凌晨 4 点运行。
 
 [Script]
-cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 120, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
+cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
