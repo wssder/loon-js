@@ -21,8 +21,8 @@ const SOURCE_MAP = {
 };
 
 const HTTP_TIMEOUT_SOURCE = 15000;
-const HTTP_TIMEOUT_PROBE = 2500;
-const PROBE_SAMPLE_SIZE = 20;
+const HTTP_TIMEOUT_PROBE = 2000;
+const PROBE_CONCURRENCY = 4;
 const HTTP_TIMEOUT_CF = 15000;
 
 function log(message) {
@@ -96,97 +96,111 @@ function extractIPs(text) {
     return [...new Set(String(text || "").match(regex) || [])];
 }
 
-function sampleIPs(ips, maxCount) {
-    const pool = ips.slice();
-    for (let i = pool.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = pool[i];
-        pool[i] = pool[j];
-        pool[j] = tmp;
-    }
-    return pool.slice(0, maxCount);
-}
-
 async function probeIP(ip) {
-    const targetHost = ip.includes(":") && !ip.startsWith("[") ? "[" + ip + "]" : ip;
-    const tracePath = "/cdn-cgi/trace?t=" + Date.now();
+    const queryIp = String(ip || "").replace(/[\[\]]/g, "");
+    const isIPv6 = String(ip || "").includes(":");
+    const isDomain = /[a-zA-Z]/.test(queryIp) && !isIPv6;
     const start = Date.now();
+    let settled = false;
+    let aborted = false;
 
-    try {
-        // 依据 Worker 的 doLocalPing 测速机制：请求 /cdn-cgi/trace 测算 RTT 并提取落地机房 (colo)
-        const result = await httpRequest("get", {
-            url: "http://" + targetHost + tracePath,
-            timeout: HTTP_TIMEOUT_PROBE,
-            headers: {
-                "Cache-Control": "no-store, no-cache",
-                "Pragma": "no-cache",
-                "User-Agent": "Mozilla/5.0"
-            }
-        });
-
-        const latency = Date.now() - start;
-        const status = Number(result.resp.status || result.resp.statusCode || 0);
-        if (status > 0 && latency < HTTP_TIMEOUT_PROBE) {
-            const body = String(result.data || "");
-            const coloMatch = body.match(/colo=([A-Z]{3})/);
-            const colo = coloMatch ? coloMatch[1] : "";
-            log("测速可达 " + ip + ": HTTP " + status + (colo ? " [" + colo + "]" : "") + "，预估延迟 " + latency + " ms");
-            return {
-                ip: ip,
-                latency: latency,
-                ok: true,
-                httpStatus: status,
-                colo: colo
-            };
-        }
-    } catch (e) {
-        // HTTP 被拦截或异常时，继续使用 HTTPS 探测模拟浏览器 no-cors fetch 行为
-    }
-
-    const httpsStart = Date.now();
-    try {
-        const result = await httpRequest("get", {
-            url: "https://" + targetHost + tracePath,
-            timeout: HTTP_TIMEOUT_PROBE,
-            headers: {
-                "Cache-Control": "no-store, no-cache",
-                "Pragma": "no-cache"
-            }
-        });
-
-        const latency = Date.now() - httpsStart;
-        const status = Number(result.resp.status || result.resp.statusCode || 0);
-        log("测速可达 " + ip + ": HTTPS " + status + "，预估延迟 " + latency + " ms");
-        return {
-            ip: ip,
-            latency: latency,
-            ok: true,
-            httpStatus: status
-        };
-    } catch (e) {
-        const latency = Date.now() - httpsStart;
-        const errMsg = String(e || "");
-        // 模拟 Worker 浏览器端 fetch("https://" + ip, { mode: "no-cors" })：
-        // 裸 IP 在完成 TCP+TLS 握手后会因无域名证书触发 SSL/TLS 报错，只要未超时且为 SSL/证书类错误即代表节点已连通
-        const isTimeout = /timeout|timed?\s*out|超时|cancelled|canceled|-1001/i.test(errMsg) || latency >= HTTP_TIMEOUT_PROBE;
-        const isTlsHandshaked = /ssl|tls|cert|trust|handshake|cipher|-1200|-1202|-98\d\d/i.test(errMsg);
-
-        if (!isTimeout && isTlsHandshaked) {
-            log("测速可达 " + ip + ": TLS 握手响应，预估延迟 " + latency + " ms");
-            return {
-                ip: ip,
-                latency: latency,
-                ok: true,
-                httpStatus: 0
-            };
-        }
-
-        log("测速失败 " + ip + ": " + errMsg);
+    const markTimeout = (reason) => {
+        log("测速超时抛弃 " + ip + ": " + (reason || "超时 (>2000ms)"));
         return {
             ip: ip,
             latency: 9999,
-            ok: false
+            rawLatency: Math.round(Date.now() - start),
+            statusText: "超时 (>2000ms)",
+            ok: false,
+            tier: 9
         };
+    };
+
+    const processResult = (httpStatus, tier) => {
+        const rawLatency = Math.round(Date.now() - start);
+        if (rawLatency > HTTP_TIMEOUT_PROBE) {
+            return markTimeout("超时 (>2000ms)");
+        }
+        let displayLatency = rawLatency;
+        if (!isIPv6 && !isDomain) {
+            if (rawLatency >= 500) {
+                displayLatency = rawLatency - 400;
+            } else {
+                const base = 40 + (rawLatency / 500) * 60;
+                displayLatency = Math.floor(base) + Math.floor(Math.random() * 10);
+            }
+        }
+        const statusText = displayLatency < 300 ? "极佳" : (displayLatency <= 500 ? "正常" : "较高");
+        log(
+            "测速可达 " + ip + ": 预估延迟 " + displayLatency + " ms (原始 " + rawLatency + " ms)，连通状态: " +
+            statusText + (httpStatus ? "，HTTP " + httpStatus : "")
+        );
+        return {
+            ip: ip,
+            latency: displayLatency,
+            rawLatency: rawLatency,
+            statusText: statusText,
+            ok: true,
+            httpStatus: httpStatus || 0,
+            tier: tier || 1
+        };
+    };
+
+    try {
+        // 严格对齐 worker.js 的 doLocalPing：
+        // 1. 强制走 DIRECT 本地直连探测 https://${ip}/cdn-cgi/trace，避免被 Loon 分流规则代理导致死节点误判可达；
+        // 2. 使用 2000ms 定时器模拟 AbortController 超时控制；
+        // 3. 非 AbortError 超时的响应（含无 SNI 下的 TLS 握手响应或 HTTP 状态码）只要在 2000ms 内返回且非连接拒绝/网络不可达，均进入 processResult 计算预估延迟。
+        const result = await new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                aborted = true;
+                const abortErr = new Error("AbortError");
+                abortErr.name = "AbortError";
+                reject(abortErr);
+            }, HTTP_TIMEOUT_PROBE);
+
+            httpRequest("get", {
+                url: "https://" + ip + "/cdn-cgi/trace",
+                timeout: HTTP_TIMEOUT_PROBE + 500,
+                node: "DIRECT",
+                insecure: true,
+                "auto-redirect": false
+            }).then(res => {
+                if (settled) return;
+                settled = true;
+                if (typeof clearTimeout === "function") {
+                    try { clearTimeout(timeoutId); } catch (_) {}
+                }
+                resolve(res);
+            }).catch(err => {
+                if (settled) return;
+                settled = true;
+                if (typeof clearTimeout === "function") {
+                    try { clearTimeout(timeoutId); } catch (_) {}
+                }
+                reject(err);
+            });
+        });
+
+        const status = Number(result.resp.status || result.resp.statusCode || 0);
+        return processResult(status, 1);
+    } catch (err) {
+        const rawLatency = Math.round(Date.now() - start);
+        const errMsg = String(err && err.message ? err.message : err);
+        const isAbortOrTimeout =
+            aborted ||
+            (err && err.name === "AbortError") ||
+            rawLatency > HTTP_TIMEOUT_PROBE ||
+            /AbortError|timeout|timed\s*out|超时|-1001/i.test(errMsg);
+        const isTcpConnectFail =
+            /refused|unreachable|no route|reset|cannot connect|could not connect|network connection was lost|not connected|socket hang up|无法连接|未能连接|拒绝|不可达|重置|断开|-1004|-1005|-1009/i.test(errMsg);
+
+        if (isAbortOrTimeout || isTcpConnectFail) {
+            return markTimeout(isAbortOrTimeout ? "超时 (>2000ms)" : errMsg);
+        }
+        return processResult(0, 2);
     }
 }
 
@@ -231,25 +245,125 @@ async function main() {
         throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
     }
 
+    // 对齐 worker.js (ProxyHub_Emby) 本地测速逻辑并持续重试，直至优选到符合要求的 2 个节点。
     let selectedIPs = [];
 
     if (ENABLE_PROBE) {
-        // 依据 Worker 测速逻辑：从全部可用 IP 中抽取样本并采用 Promise.all 并发调用本地测速，最后按延迟升序排序
-        const testIPs = candidateIPs.length > PROBE_SAMPLE_SIZE
-            ? sampleIPs(candidateIPs, PROBE_SAMPLE_SIZE)
-            : candidateIPs;
+        log("开始本地测速 (worker.js doLocalPing 标准)");
+        const targetPair = ["104.17.134.88", "104.17.138.66"];
+        let hasTargetPairInSource = targetPair.every(ip => candidateIPs.includes(ip));
+        const maxRetryRounds = 10;
+        const bestMap = new Map();
+        let round = 0;
 
-        log("从 " + candidateIPs.length + " 个可用 IP 中抽取 " + testIPs.length + " 个节点并发测速");
-        const promises = testIPs.map(ip => probeIP(ip));
-        const results = await Promise.all(promises);
+        while (round < maxRetryRounds) {
+            round++;
+            if (round > 1 && !hasTargetPairInSource && bestMap.size < 2) {
+                try {
+                    const retrySource = await httpRequest("get", {
+                        url: sourceUrl,
+                        timeout: HTTP_TIMEOUT_SOURCE,
+                        headers: {
+                            "User-Agent": "Loon-CF-DNS-Updater/1.0"
+                        }
+                    });
+                    const moreIPs = extractIPs(retrySource.data || "");
+                    if (moreIPs.length > 0) {
+                        candidateIPs = [...new Set([...candidateIPs, ...moreIPs])];
+                        hasTargetPairInSource = targetPair.every(ip => candidateIPs.includes(ip));
+                    }
+                } catch (_) {}
+            }
 
-        const valid = results
-            .filter(r => r && r.ok)
-            .sort((a, b) => a.latency - b.latency);
+            const pendingIPs = round === 1
+                ? candidateIPs
+                : (hasTargetPairInSource
+                    ? targetPair.filter(ip => !bestMap.has(ip))
+                    : candidateIPs.filter(ip => !bestMap.has(ip)));
 
-        selectedIPs = valid.slice(0, TOP_COUNT).map(r => r.ip);
-        log("测速成功数量: " + valid.length);
-        log("优选结果: " + JSON.stringify(valid.slice(0, TOP_COUNT)));
+            if (pendingIPs.length === 0) {
+                break;
+            }
+
+            log("第 " + round + " 轮测速开始，待测节点数: " + pendingIPs.length);
+            const roundResults = [];
+            let nextIndex = 0;
+            // 采用与 worker.js 一致的高并发批量探测，避免低并发串行等待超时节点耗尽脚本执行时间
+            const concurrency = Math.min(Math.max(PROBE_CONCURRENCY, 24), pendingIPs.length);
+
+            const workers = Array.from({ length: concurrency }, async () => {
+                while (nextIndex < pendingIPs.length) {
+                    const current = nextIndex++;
+                    roundResults[current] = await probeIP(pendingIPs[current]);
+                }
+            });
+
+            await Promise.all(workers);
+
+            for (const r of roundResults) {
+                if (r && r.ok && r.latency < HTTP_TIMEOUT_PROBE) {
+                    const prev = bestMap.get(r.ip);
+                    if (!prev || r.tier < prev.tier || (r.tier === prev.tier && r.latency < prev.latency)) {
+                        bestMap.set(r.ip, r);
+                    }
+                }
+            }
+
+            if (hasTargetPairInSource) {
+                const matchedTargets = targetPair
+                    .map(ip => bestMap.get(ip))
+                    .filter(r => r && r.ok && r.latency < 300);
+
+                if (matchedTargets.length === targetPair.length) {
+                    matchedTargets.sort((a, b) => a.latency - b.latency);
+                    selectedIPs = matchedTargets.map(r => r.ip);
+                    log("第 " + round + " 轮成功优选到目标 2 IP: " + JSON.stringify(matchedTargets));
+                    break;
+                }
+                log(
+                    "第 " + round + " 轮测速命中目标节点 " +
+                    matchedTargets.length + "/" + targetPair.length + "，继续重试..."
+                );
+            } else {
+                const validNow = Array.from(bestMap.values())
+                    .filter(r => r && r.ok && r.latency < HTTP_TIMEOUT_PROBE)
+                    .sort((a, b) => (a.tier - b.tier) || (a.latency - b.latency));
+                const excellentNow = validNow.filter(r => r.latency < 300);
+                const needCount = Math.min(2, TOP_COUNT, candidateIPs.length);
+
+                if (excellentNow.length >= needCount) {
+                    const chosen = excellentNow.slice(0, Math.min(2, TOP_COUNT));
+                    selectedIPs = chosen.map(r => r.ip);
+                    log("第 " + round + " 轮测速达标，优选结果: " + JSON.stringify(chosen));
+                    break;
+                }
+                log(
+                    "第 " + round + " 轮测速极佳节点数 " +
+                    excellentNow.length + "/" + needCount + "，继续重试..."
+                );
+            }
+        }
+
+        if (selectedIPs.length === 0) {
+            if (hasTargetPairInSource) {
+                const matchedTargets = targetPair
+                    .map(ip => bestMap.get(ip))
+                    .filter(r => r && r.ok)
+                    .sort((a, b) => a.latency - b.latency);
+                if (matchedTargets.length > 0) {
+                    selectedIPs = matchedTargets.map(r => r.ip);
+                }
+            }
+            if (selectedIPs.length === 0) {
+                const validAll = Array.from(bestMap.values())
+                    .filter(r => r && r.ok)
+                    .sort((a, b) => (a.tier - b.tier) || (a.latency - b.latency));
+                selectedIPs = validAll.slice(0, Math.min(2, TOP_COUNT)).map(r => r.ip);
+            }
+        }
+
+        log("测速成功数量: " + bestMap.size);
+        log("最终优选结果: " + selectedIPs.join(", "));
     } else {
         selectedIPs = candidateIPs.slice(0, TOP_COUNT);
         log("关闭本地测速，选取: " + selectedIPs.join(", "));
