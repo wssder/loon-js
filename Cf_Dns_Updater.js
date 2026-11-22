@@ -180,6 +180,30 @@ function getPayloadBytes(data, headers) {
     return 0;
 }
 
+function decodeErrorSnippet(data) {
+    if (!data) return "";
+    if (typeof data === "string") {
+        return data.replace(/\s+/g, " ").trim().slice(0, 140);
+    }
+    try {
+        let bytes = null;
+        if (typeof ArrayBuffer !== "undefined") {
+            if (data instanceof ArrayBuffer) bytes = new Uint8Array(data, 0, Math.min(data.byteLength, 256));
+            else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, Math.min(data.byteLength, 256));
+        }
+        if (bytes) {
+            let out = "";
+            for (let i = 0; i < bytes.length; i++) {
+                const c = bytes[i];
+                if (c >= 32 && c <= 126) out += String.fromCharCode(c);
+                else if (c === 10 || c === 13 || c === 9) out += " ";
+            }
+            return out.replace(/\s+/g, " ").trim().slice(0, 140);
+        }
+    } catch (_) {}
+    return "";
+}
+
 async function measureDownloadSpeed(ip, speedTarget) {
     const start = Date.now();
     const portPart = speedTarget.port ? (":" + speedTarget.port) : "";
@@ -194,15 +218,19 @@ async function measureDownloadSpeed(ip, speedTarget) {
             "binary-mode": true,
             headers: {
                 "Host": speedTarget.hostHeader,
+                "Referer": "https://" + speedTarget.host + "/",
+                "Origin": "https://" + speedTarget.host,
+                "Accept": "*/*",
                 "Range": "bytes=0-" + (SPEEDTEST_MAX_BYTES - 1),
                 "Cache-Control": "no-cache",
-                "User-Agent": "Loon-CF-DNS-Updater/1.0"
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
             }
         });
 
         const elapsedMs = Math.max(1, Date.now() - start);
         const status = Number(result.resp.status || result.resp.statusCode || 0);
         const bytes = getPayloadBytes(result.data, result.resp.headers);
+        const errSnippet = (status !== 200 && status !== 206) ? decodeErrorSnippet(result.data) : "";
         result = null; // 及时释放二进制缓冲区引用
 
         if (status === 301 || status === 302 || status === 307 || status === 308) {
@@ -211,7 +239,7 @@ async function measureDownloadSpeed(ip, speedTarget) {
         }
 
         if (status !== 200 && status !== 206) {
-            log("下载测速失败 " + ip + ": HTTP " + status);
+            log("下载测速失败 " + ip + ": HTTP " + status + (errSnippet ? " | " + errSnippet : ""));
             return { ok: false, speedMBps: 0, bytes: 0, elapsedMs: elapsedMs };
         }
 
