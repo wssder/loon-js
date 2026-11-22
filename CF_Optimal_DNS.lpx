@@ -1,8 +1,8 @@
 #!name = CF 优选 DNS 更新修复版
-#!desc = 恢复之前可解析的单次数据源读取方式；支持 CFYes、Mia、WeTest、UOUIN 和自定义线路，支持可选本地测速及 Cloudflare DNS 更新。
+#!desc = 支持 CFYes、Mia、WeTest、UOUIN 和自定义线路，支持本地延迟复测、5MB HTTP 下载速度门槛筛选及 Cloudflare DNS 自动保活更新。
 #!author = @wssder
 #!homepage = https://github.com/wssder/loon-js
-#!date = 2026-11-16
+#!date = 2026-11-22
 #!system = iOS, iPadOS, macOS
 #!loon_version = 3.5.1
 
@@ -14,7 +14,9 @@ cf_token = input, "", tag = [Cloudflare]API Token, desc = 需要具有 Zone DNS 
 zone_id = input, "", tag = [Cloudflare]Zone ID, desc = Cloudflare 域名 Zone ID。
 record_name = input, "", tag = [DNS]域名, desc = 需要更新的完整 DNS 主机名。
 custom_api = input, "https://bestcf.tools12345.com/cmliu2/all.txt", tag = [高级]自定义 API, desc = 选择 Custom_自定义 时使用的 IP 文本源地址。
+speedtest_url = input, "http://speed.cloudflare.com/__down?bytes=5242880", tag = [测速]HTTP 下载测速地址, desc = 默认使用 Cloudflare 官方 HTTP 5MB 测速接口（清空则关闭下载测速，仅按延迟与稳定性优选）。
+min_speed = input, "3", tag = [测速]最低下载速度(MB/s), desc = 选节点的下载速度门槛（MB/s）；在岗与补位节点均优先筛选达到此速度的零丢包节点，填 0 则仅按速度排序。
 cron_exp = input, "0 4 * * *", tag = [定时]Cron, desc = 默认每天凌晨 4 点运行。
 
 [Script]
-cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/Cf_Dns_Updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
+cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api},{speedtest_url},{min_speed}]
