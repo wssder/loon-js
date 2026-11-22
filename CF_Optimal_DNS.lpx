@@ -17,4 +17,4 @@ custom_api = input, "https://bestcf.tools12345.com/cmliu2/all.txt", tag = [高�
 cron_exp = input, "0 4 * * *", tag = [定时]Cron, desc = 默认每天凌晨 4 点运行。
 
 [Script]
-cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/cf_dns_updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
+cron {cron_exp} script-path = https://raw.githubusercontent.com/wssder/loon-js/main/Cf_Dns_Updater.js, tag = CF优选DNS更新, timeout = 180, argument = [{isp_type},{ip_count},{enable_probe},{cf_token},{zone_id},{record_name},{custom_api}]
