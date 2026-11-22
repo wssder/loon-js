@@ -12,6 +12,14 @@ const ZONE_ID = String(args.zone_id || "").trim();
 const RECORD_NAME = String(args.record_name || "").trim();
 const CUSTOM_API = String(args.custom_api || "").trim();
 
+const DEFAULT_SPEEDTEST_URL = "http://speed.cloudflare.com/__down?bytes=5242880";
+const SPEEDTEST_URL = args.speedtest_url === undefined
+    ? DEFAULT_SPEEDTEST_URL
+    : String(args.speedtest_url || "").trim();
+
+const parsedMinSpeed = parseFloat(args.min_speed !== undefined ? args.min_speed : "3");
+const MIN_DOWNLOAD_MBPS = Number.isFinite(parsedMinSpeed) && parsedMinSpeed >= 0 ? parsedMinSpeed : 3;
+
 const SOURCE_MAP = {
     "CFYes": "https://bestcf.tools12345.com/cfyes/ipv4.txt",
     "Mia": "https://bestcf.tools12345.com/xinyitang3/ipv4.txt",
@@ -22,15 +30,19 @@ const SOURCE_MAP = {
 
 const HTTP_TIMEOUT_SOURCE = 15000;
 const HTTP_TIMEOUT_PROBE = 2000;
+const HTTP_TIMEOUT_SPEEDTEST = 10000;
 const PROBE_CONCURRENCY = 4;
 const HTTP_TIMEOUT_CF = 15000;
 
-// 方案 B：网段过滤与复测参数
+// 网段过滤、复测与下载测速参数
 const BLOCKED_PREFIXES = ["172.64.", "172.65.", "172.66."];
 const PREFERRED_PREFIXES = ["104.17."];
 const PREFERRED_BONUS_MS = 30;
-const RETEST_EXTRA_ROUNDS = 2; // 含初筛共 3 轮探测
-const RETEST_TOP_LIMIT = Math.min(10, Math.max(TOP_COUNT * 3, 8));
+const RETEST_EXTRA_ROUNDS = 2; // 含初筛共 3 轮延迟探测
+const RETEST_TOP_LIMIT = Math.min(12, Math.max(TOP_COUNT * 4, 10));
+const SPEEDTEST_MAX_ATTEMPTS = 10; // 单次运行最多串行下载测速 10 个补位候选
+const SPEEDTEST_DEFAULT_COUNT = Math.min(6, Math.max(TOP_COUNT * 2, 5));
+const SPEEDTEST_MAX_BYTES = 5 * 1024 * 1024; // 单节点拉取 5MB：跨过 TCP 慢启动且避开 iOS 内存上限
 
 function log(message) {
     console.log("[CF-DNS] " + message);
@@ -121,6 +133,144 @@ function isSameIPList(a, b) {
     return true;
 }
 
+function parseHttpSpeedtestUrl(rawUrl) {
+    if (!rawUrl) return null;
+    const trimmed = String(rawUrl).trim();
+    if (!/^http:\/\//i.test(trimmed)) {
+        log("下载测速地址必须为 http:// 协议（不能强制跳转 HTTPS），已跳过下载测速: " + trimmed);
+        return null;
+    }
+    const match = trimmed.match(/^http:\/\/([^\/\s:]+)(?::(\d+))?(\/[^\s]*)?$/i);
+    if (!match) {
+        log("下载测速地址格式无效，已跳过下载测速: " + trimmed);
+        return null;
+    }
+    const host = match[1];
+    const port = match[2] || "";
+    const path = match[3] || "/";
+    return {
+        host: host,
+        port: port,
+        path: path,
+        hostHeader: port ? (host + ":" + port) : host
+    };
+}
+
+function getPayloadBytes(data, headers) {
+    if (data) {
+        if (typeof ArrayBuffer !== "undefined") {
+            if (data instanceof ArrayBuffer) return data.byteLength;
+            if (ArrayBuffer.isView(data)) return data.byteLength;
+        }
+        if (typeof data.byteLength === "number" && data.byteLength > 0) {
+            return data.byteLength;
+        }
+        if (typeof data === "string" && data.length > 0) {
+            return data.length;
+        }
+    }
+    if (headers && typeof headers === "object") {
+        for (const key of Object.keys(headers)) {
+            if (key.toLowerCase() === "content-length") {
+                const n = parseInt(headers[key], 10);
+                if (Number.isFinite(n) && n > 0) return n;
+            }
+        }
+    }
+    return 0;
+}
+
+async function measureDownloadSpeed(ip, speedTarget) {
+    const start = Date.now();
+    const portPart = speedTarget.port ? (":" + speedTarget.port) : "";
+    const targetUrl = "http://" + ip + portPart + speedTarget.path;
+
+    try {
+        let result = await httpRequest("get", {
+            url: targetUrl,
+            timeout: HTTP_TIMEOUT_SPEEDTEST,
+            node: "DIRECT",
+            "auto-redirect": false,
+            "binary-mode": true,
+            headers: {
+                "Host": speedTarget.hostHeader,
+                "Range": "bytes=0-" + (SPEEDTEST_MAX_BYTES - 1),
+                "Cache-Control": "no-cache",
+                "User-Agent": "Loon-CF-DNS-Updater/1.0"
+            }
+        });
+
+        const elapsedMs = Math.max(1, Date.now() - start);
+        const status = Number(result.resp.status || result.resp.statusCode || 0);
+        const bytes = getPayloadBytes(result.data, result.resp.headers);
+        result = null; // 及时释放二进制缓冲区引用
+
+        if (status === 301 || status === 302 || status === 307 || status === 308) {
+            log("下载测速失败 " + ip + ": HTTP " + status + " 重定向（测速地址不支持 HTTP 80 直连）");
+            return { ok: false, speedMBps: 0, bytes: 0, elapsedMs: elapsedMs };
+        }
+
+        if (status !== 200 && status !== 206) {
+            log("下载测速失败 " + ip + ": HTTP " + status);
+            return { ok: false, speedMBps: 0, bytes: 0, elapsedMs: elapsedMs };
+        }
+
+        if (bytes < 64 * 1024) {
+            log("下载测速无效 " + ip + ": 返回体积过小 (" + bytes + " B)");
+            return { ok: false, speedMBps: 0, bytes: bytes, elapsedMs: elapsedMs };
+        }
+
+        const speedMBps = Number(((bytes / (1024 * 1024)) / (elapsedMs / 1000)).toFixed(2));
+        const sizeMB = (bytes / (1024 * 1024)).toFixed(2);
+        const meetsMin = speedMBps >= MIN_DOWNLOAD_MBPS;
+        log(
+            "下载测速 " + ip + ": " + speedMBps + " MB/s (" + sizeMB + " MB / " + elapsedMs + " ms) " +
+            (meetsMin ? "[达标]" : "[低于门槛 " + MIN_DOWNLOAD_MBPS + " MB/s]")
+        );
+
+        return {
+            ok: true,
+            speedMBps: speedMBps,
+            bytes: bytes,
+            elapsedMs: elapsedMs
+        };
+    } catch (err) {
+        const elapsedMs = Math.max(1, Date.now() - start);
+        log("下载测速失败 " + ip + ": " + String(err && err.message ? err.message : err));
+        return { ok: false, speedMBps: 0, bytes: 0, elapsedMs: elapsedMs };
+    }
+}
+
+async function runSpeedTestsSequentially(items, speedTarget, targetQualifiedCount) {
+    if (!speedTarget || !items || items.length === 0) return items || [];
+    const maxAttempts = targetQualifiedCount > 0
+        ? Math.min(items.length, SPEEDTEST_MAX_ATTEMPTS)
+        : Math.min(items.length, SPEEDTEST_DEFAULT_COUNT);
+    const enriched = [];
+    let qualifiedCount = 0;
+
+    // 串行下载测速，避免多节点并发争抢手机带宽与内存；达到足够达标节点后提前结束
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (i >= maxAttempts || (targetQualifiedCount > 0 && qualifiedCount >= targetQualifiedCount)) {
+            enriched.push(item);
+            continue;
+        }
+        const speedRes = await measureDownloadSpeed(item.ip, speedTarget);
+        const meetsMin = speedRes.ok && speedRes.speedMBps >= MIN_DOWNLOAD_MBPS;
+        if (item.lossRate === 0 && meetsMin) {
+            qualifiedCount++;
+        }
+        enriched.push(Object.assign({}, item, {
+            speedTested: true,
+            speedOk: speedRes.ok,
+            speedMBps: speedRes.speedMBps,
+            meetsMinSpeed: meetsMin
+        }));
+    }
+    return enriched;
+}
+
 async function probeBatch(ips) {
     if (!ips || ips.length === 0) return [];
     const results = new Array(ips.length);
@@ -144,6 +294,47 @@ function sortByStability(items) {
         if (a.score !== b.score) return a.score - b.score;
         return a.avgLatency - b.avgLatency;
     });
+}
+
+function sortByBandwidthAndStability(items) {
+    return [...items].sort((a, b) => {
+        if (a.lossRate !== b.lossRate) return a.lossRate - b.lossRate;
+        const sa = a.speedOk ? a.speedMBps : -1;
+        const sb = b.speedOk ? b.speedMBps : -1;
+        if (sa !== sb) return sb - sa;
+        if (a.score !== b.score) return a.score - b.score;
+        return a.avgLatency - b.avgLatency;
+    });
+}
+
+function selectBestNodes(items, speedEnabled, count) {
+    if (!speedEnabled) {
+        const zeroLoss = sortByStability(items.filter(m => m.lossRate === 0));
+        const fallback = sortByStability(items.filter(m => m.lossRate > 0));
+        return zeroLoss.concat(fallback).slice(0, count);
+    }
+
+    // 1. 优先选出：零丢包 + 下载速度达到 MIN_DOWNLOAD_MBPS 的节点（按带宽降序）
+    const tier1 = sortByBandwidthAndStability(
+        items.filter(m => m.lossRate === 0 && m.speedOk && m.speedMBps >= MIN_DOWNLOAD_MBPS)
+    );
+    // 2. 若达标节点不足，其次从其余测速成功的节点中按丢包率升序、带宽降序补齐
+    const tier1Set = new Set(tier1.map(m => m.ip));
+    const tier2 = sortByBandwidthAndStability(
+        items.filter(m => !tier1Set.has(m.ip) && m.speedOk)
+    );
+    // 3. 最后兜底：若下载测速均失败，回退至延迟与抖动综合排序
+    const tier2Set = new Set(tier2.map(m => m.ip));
+    const tier3 = sortByStability(
+        items.filter(m => !tier1Set.has(m.ip) && !tier2Set.has(m.ip))
+    );
+
+    log(
+        "选优分层统计: 零丢包且达标(>=" + MIN_DOWNLOAD_MBPS + " MB/s) " + tier1.length +
+        " 个, 其余测速可达 " + tier2.length +
+        " 个, 延迟兜底 " + tier3.length + " 个"
+    );
+    return tier1.concat(tier2, tier3).slice(0, count);
 }
 
 async function verifyStability(initialResults, extraRounds) {
@@ -180,7 +371,11 @@ async function verifyStability(initialResults, extraRounds) {
                     avgLatency: 9999,
                     jitter: 9999,
                     score: 99999,
-                    preferred: isPreferredIP(first.ip)
+                    preferred: isPreferredIP(first.ip),
+                    speedTested: false,
+                    speedOk: false,
+                    speedMBps: 0,
+                    meetsMinSpeed: false
                 };
                 continue;
             }
@@ -209,7 +404,11 @@ async function verifyStability(initialResults, extraRounds) {
                 avgLatency: avgLatency,
                 jitter: jitter,
                 score: score,
-                preferred: preferred
+                preferred: preferred,
+                speedTested: false,
+                speedOk: false,
+                speedMBps: 0,
+                meetsMinSpeed: false
             };
         }
     });
@@ -344,6 +543,11 @@ async function main() {
         throw new Error("IP 数据源地址为空");
     }
 
+    const speedTarget = parseHttpSpeedtestUrl(SPEEDTEST_URL);
+    if (speedTarget) {
+        log("已启用 HTTP 下载测速: http://" + speedTarget.hostHeader + speedTarget.path + " (最低速度门槛: " + MIN_DOWNLOAD_MBPS + " MB/s)");
+    }
+
     const headers = {
         "Authorization": "Bearer " + CF_TOKEN,
         "Content-Type": "application/json"
@@ -401,23 +605,40 @@ async function main() {
 
     const existingRawIPs = existing.map(r => String(r.content || "").trim()).filter(Boolean);
     let selectedIPs = [];
+    let selectedMetrics = [];
 
     if (ENABLE_PROBE) {
         const candidateSet = new Set(candidateIPs);
         const activeCandidates = [...new Set(existingRawIPs)].filter(ip => candidateSet.has(ip));
+        let activePool = [];
         let healthyExisting = [];
 
         if (activeCandidates.length > 0) {
             log("优先复测在岗 IP (" + activeCandidates.length + " 个)");
             const activeFirst = await probeBatch(activeCandidates);
             const activeVerified = await verifyStability(activeFirst, RETEST_EXTRA_ROUNDS);
-            healthyExisting = activeVerified.filter(m => m.lossRate === 0);
-            log("在岗零丢包数量: " + healthyExisting.length);
+            const activeZeroLoss = activeVerified.filter(m => m.lossRate === 0);
+
+            if (speedTarget && activeZeroLoss.length > 0) {
+                log("对在岗零丢包 IP 进行下载测速 (" + activeZeroLoss.length + " 个)");
+                const activeSpeedChecked = await runSpeedTestsSequentially(activeZeroLoss, speedTarget, 0);
+                activePool = activeSpeedChecked;
+                const activeAnySpeedOk = activeSpeedChecked.some(m => m.speedOk);
+                healthyExisting = activeAnySpeedOk
+                    ? activeSpeedChecked.filter(m => m.speedOk && m.speedMBps >= MIN_DOWNLOAD_MBPS)
+                    : activeZeroLoss;
+                log("在岗达标数量: " + healthyExisting.length + " (要求零丢包且 >=" + MIN_DOWNLOAD_MBPS + " MB/s)");
+            } else {
+                activePool = activeZeroLoss;
+                healthyExisting = activeZeroLoss;
+                log("在岗零丢包数量: " + healthyExisting.length);
+            }
         }
 
         if (healthyExisting.length >= TOP_COUNT) {
-            selectedIPs = healthyExisting.slice(0, TOP_COUNT).map(m => m.ip);
-            log("在岗 IP 全部零丢包健康，跳过全池测速");
+            selectedMetrics = selectBestNodes(healthyExisting, Boolean(speedTarget), TOP_COUNT);
+            selectedIPs = selectedMetrics.map(m => m.ip);
+            log("在岗 IP 全部健康达标，跳过全池测速");
         } else {
             const testedSet = new Set(activeCandidates);
             const remainingCandidates = candidateIPs.filter(ip => !testedSet.has(ip));
@@ -431,14 +652,19 @@ async function main() {
 
             const shortlist = stage1Passed.slice(0, RETEST_TOP_LIMIT);
             log("对初筛前 " + shortlist.length + " 个候选进行 " + (1 + RETEST_EXTRA_ROUNDS) + " 轮稳定性复测");
-            const verifiedRemaining = await verifyStability(shortlist, RETEST_EXTRA_ROUNDS);
+            let verifiedRemaining = await verifyStability(shortlist, RETEST_EXTRA_ROUNDS);
 
-            const combined = sortByStability(healthyExisting.concat(verifiedRemaining));
-            const zeroLoss = combined.filter(m => m.lossRate === 0);
-            const finalPool = zeroLoss.length >= TOP_COUNT ? zeroLoss : combined;
+            if (speedTarget && verifiedRemaining.length > 0) {
+                const needMore = Math.max(1, TOP_COUNT - healthyExisting.length);
+                const targetQualified = MIN_DOWNLOAD_MBPS > 0 ? (needMore + 1) : 0;
+                log("对稳定性候选进行串行下载测速（需补位 " + needMore + " 个，门槛 >=" + MIN_DOWNLOAD_MBPS + " MB/s）");
+                verifiedRemaining = await runSpeedTestsSequentially(verifiedRemaining, speedTarget, targetQualified);
+            }
 
-            selectedIPs = finalPool.slice(0, TOP_COUNT).map(m => m.ip);
-            log("最终优选结果: " + JSON.stringify(finalPool.slice(0, TOP_COUNT)));
+            const combined = activePool.concat(verifiedRemaining);
+            selectedMetrics = selectBestNodes(combined, Boolean(speedTarget), TOP_COUNT);
+            selectedIPs = selectedMetrics.map(m => m.ip);
+            log("最终优选结果: " + JSON.stringify(selectedMetrics));
         }
     } else {
         const preferredFirst = candidateIPs.filter(isPreferredIP).concat(candidateIPs.filter(ip => !isPreferredIP(ip)));
@@ -450,10 +676,18 @@ async function main() {
         throw new Error("没有可用 IP，原 DNS 记录保持不变");
     }
 
+    const ipSummaryText = selectedMetrics.length > 0
+        ? selectedMetrics.map(m =>
+            m.speedOk
+                ? (m.ip + " (" + m.speedMBps + " MB/s, " + m.avgLatency + "ms)")
+                : (m.ip + " (" + m.avgLatency + "ms)")
+        ).join(", ")
+        : selectedIPs.join(", ");
+
     const summary =
         "域名: " + RECORD_NAME +
         "\n线路: " + ISP_TYPE +
-        "\n当前 IP: " + selectedIPs.join(", ");
+        "\n当前 IP: " + ipSummaryText;
 
     if (isSameIPList(existingRawIPs, selectedIPs)) {
         log("DNS 记录无变化，跳过更新");
