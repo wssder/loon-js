@@ -1,18 +1,21 @@
 /**
- * CF 优选 DNS 更新修复版
+ * CF 优选 DNS 更新（Emby 观影优化版）
  * Loon 专用
  */
 
 const args = ($argument && typeof $argument === "object") ? $argument : {};
-const ISP_TYPE = String(args.isp_type || "UOUIN");
+const ISP_TYPE = String(args.isp_type || "V2Too_CM");
 const TOP_COUNT = Math.max(1, Math.min(5, parseInt(args.ip_count || "3", 10) || 3));
-const ENABLE_PROBE = args.enable_probe === true || args.enable_probe === "true";
+const ENABLE_PROBE = args.enable_probe === undefined ? true : (args.enable_probe === true || args.enable_probe === "true");
 const CF_TOKEN = String(args.cf_token || "").trim();
 const ZONE_ID = String(args.zone_id || "").trim();
 const RECORD_NAME = String(args.record_name || "").trim();
 const CUSTOM_API = String(args.custom_api || "").trim();
 
 const SOURCE_MAP = {
+    "V2Too_CM": "https://ip.v2too.top/api/nodes?carrier=cm",
+    "V2Too_CT": "https://ip.v2too.top/api/nodes?carrier=ct",
+    "V2Too_CU": "https://ip.v2too.top/api/nodes?carrier=cu",
     "CFYes": "https://bestcf.tools12345.com/cfyes/ipv4.txt",
     "Mia": "https://bestcf.tools12345.com/xinyitang3/ipv4.txt",
     "WeTest": "https://bestcf.tools12345.com/wetest/ipv4.txt",
@@ -23,20 +26,17 @@ const SOURCE_MAP = {
 const HTTP_TIMEOUT_SOURCE = 15000;
 const HTTP_TIMEOUT_PROBE = 2000;
 const PROBE_CONCURRENCY = 4;
+const REPROBE_ROUNDS = 2; // 初筛 1 轮 + 复测 2 轮 = 共 3 轮稳定性验证
+const RANK_PENALTY_MS = 15; // 保留源站带宽排名权重，避免低速节点凭几毫秒延迟反超高速节点
 const HTTP_TIMEOUT_CF = 15000;
-
-const RETEST_EXTRA_ROUNDS = 2; // 含初筛共 3 轮探测
-const RETEST_TOP_LIMIT = Math.min(10, Math.max(TOP_COUNT * 3, 8));
 
 function log(message) {
     console.log("[CF-DNS] " + message);
 }
 
-function notify(title, subtitle, content) {
-    try {
-        $notification.post(title, subtitle || "", content || "");
-    } catch (e) {
-        log("通知失败: " + String(e));
+function notify(title, subtitle, body) {
+    if (typeof $notification !== "undefined" && typeof $notification.post === "function") {
+        $notification.post(title, subtitle, body);
     }
 }
 
@@ -89,7 +89,7 @@ function assertCloudflare(result, label) {
                 (e.message || JSON.stringify(e))
             ).join(" | ")
             : String(result.data).slice(0, 500);
-        throw new Error(label + "失败: " + errors);
+        throw new Error(label + " 失败: " + errors);
     }
     return json;
 }
@@ -99,162 +99,36 @@ function extractIPs(text) {
     return [...new Set(String(text || "").match(regex) || [])];
 }
 
-function isSameIPList(a, b) {
-    if (a.length !== b.length) return false;
-    const sa = [...a].sort();
-    const sb = [...b].sort();
-    for (let i = 0; i < sa.length; i++) {
-        if (sa[i] !== sb[i]) return false;
-    }
-    return true;
+function hasError1034(bodyText) {
+    return /error\s*code:\s*1034|error\s*1034|edge\s*ip\s*restricted/i.test(String(bodyText || ""));
 }
 
-async function probeBatch(ips) {
-    if (!ips || ips.length === 0) return [];
-    const results = new Array(ips.length);
-    let nextIndex = 0;
-    const workerCount = Math.min(PROBE_CONCURRENCY, ips.length);
-
-    const workers = Array.from({ length: workerCount }, async () => {
-        while (nextIndex < ips.length) {
-            const current = nextIndex++;
-            results[current] = await probeIP(ips[current]);
-        }
-    });
-
-    await Promise.all(workers);
-    return results;
-}
-
-function sortByStability(items) {
-    return [...items].sort((a, b) => {
-        if (a.lossRate !== b.lossRate) return a.lossRate - b.lossRate;
-        if (a.score !== b.score) return a.score - b.score;
-        return a.avgLatency - b.avgLatency;
-    });
-}
-
-async function verifyStability(initialResults, extraRounds) {
-    if (!initialResults || initialResults.length === 0) return [];
-    const totalRounds = 1 + extraRounds;
-    const metrics = new Array(initialResults.length);
-    let nextIndex = 0;
-    const workerCount = Math.min(2, initialResults.length);
-
-    const workers = Array.from({ length: workerCount }, async () => {
-        while (nextIndex < initialResults.length) {
-            const current = nextIndex++;
-            const first = initialResults[current];
-            const samples = [];
-            if (first && first.ok) {
-                samples.push(first.rawLatency);
-            }
-
-            for (let r = 0; r < extraRounds; r++) {
-                const res = await probeIP(first.ip);
-                if (res && res.ok) {
-                    samples.push(res.rawLatency);
-                }
-            }
-
-            const successCount = samples.length;
-            if (successCount === 0) {
-                metrics[current] = {
-                    ip: first.ip,
-                    ok: false,
-                    successCount: 0,
-                    totalRounds: totalRounds,
-                    lossRate: 1,
-                    avgLatency: 9999,
-                    jitter: 9999,
-                    score: 99999
-                };
-                continue;
-            }
-
-            const sum = samples.reduce((acc, v) => acc + v, 0);
-            const avgLatency = Math.round(sum / successCount);
-            const jitter = Math.max(...samples) - Math.min(...samples);
-            const lossRate = (totalRounds - successCount) / totalRounds;
-            const score = avgLatency + Math.round(jitter * 0.5);
-
-            log(
-                "复测统计 " + first.ip +
-                ": 成功 " + successCount + "/" + totalRounds +
-                ", 均延迟 " + avgLatency + " ms, 抖动 " + jitter + " ms, 综合分 " + score
-            );
-
-            metrics[current] = {
-                ip: first.ip,
-                ok: true,
-                successCount: successCount,
-                totalRounds: totalRounds,
-                lossRate: lossRate,
-                avgLatency: avgLatency,
-                jitter: jitter,
-                score: score
-            };
-        }
-    });
-
-    await Promise.all(workers);
-    return sortByStability(metrics.filter(m => m && m.ok));
-}
-
-async function probeIP(ip) {
-    const queryIp = String(ip || "").replace(/[\[\]]/g, "");
-    const isIPv6 = String(ip || "").includes(":");
-    const isDomain = /[a-zA-Z]/.test(queryIp) && !isIPv6;
+async function probeOnce(ip) {
     const start = Date.now();
     let settled = false;
     let aborted = false;
 
-    const markTimeout = (reason) => {
-        log("测速抛弃 " + ip + ": " + (reason || "超时 (>2000ms)"));
-        return {
-            ip: ip,
-            latency: 9999,
-            rawLatency: Math.round(Date.now() - start),
-            statusText: "超时 (>2000ms)",
-            ok: false
-        };
-    };
+    const fail = (reason) => ({
+        ip: ip,
+        rawLatency: 9999,
+        ok: false,
+        reason: reason || "超时 (>2000ms)"
+    });
 
-    const processResult = (httpStatus) => {
+    const succeed = (httpStatus) => {
         const rawLatency = Math.round(Date.now() - start);
         if (rawLatency > HTTP_TIMEOUT_PROBE) {
-            return markTimeout("超时 (>2000ms)");
+            return fail("超时 (>2000ms)");
         }
-        let displayLatency = rawLatency;
-        if (!isIPv6 && !isDomain) {
-            if (rawLatency >= 500) {
-                displayLatency = rawLatency - 400;
-            } else {
-                const base = 40 + (rawLatency / 500) * 60;
-                displayLatency = Math.floor(base) + Math.floor(Math.random() * 10);
-            }
-        }
-        const statusText = displayLatency < 300 ? "极佳" : (displayLatency <= 500 ? "正常" : "较高");
-        log(
-            "测速可达 " + ip + ": 原始延迟 " + rawLatency + " ms (预估 " + displayLatency + " ms), 连通状态: " +
-            statusText + (httpStatus ? ", HTTP " + httpStatus : "")
-        );
         return {
             ip: ip,
-            latency: displayLatency,
             rawLatency: rawLatency,
-            statusText: statusText,
             ok: true,
             httpStatus: httpStatus || 0
         };
     };
 
     try {
-        // 1:1 还原 worker.js 的 doLocalPing 逻辑：
-        // 1. 探测 https://${ip}/cdn-cgi/trace，指定 node: "DIRECT" 保证本地直连测速；
-        // 2. 2000ms 定时器对应 worker.js 的 AbortController (setTimeout(() => controller.abort(), 2000))；
-        // 3. 在 worker.js 中：catch (err) { if (err.name === 'AbortError') markTimeout(...); else processResult(); }
-        //    即对裸 IP 发起 HTTPS 请求触发的 SSL/TLS 握手报错（非超时、非 TCP 拒绝/不可达）同样进入 processResult 计算延迟。
         const result = await new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 if (settled) return;
@@ -288,12 +162,11 @@ async function probeIP(ip) {
             });
         });
 
-        const status = Number(result.resp.status || result.resp.statusCode || 0);
-        const bodySample = String(result.data || "").slice(0, 500);
-        if (/Error\s*1034|Edge IP Restricted/i.test(bodySample)) {
-            return markTimeout("命中 Error 1034");
+        if (hasError1034(result.data)) {
+            return fail("Error 1034 (Edge IP Restricted)");
         }
-        return processResult(status);
+        const status = Number(result.resp.status || result.resp.statusCode || 0);
+        return succeed(status);
     } catch (err) {
         const rawLatency = Math.round(Date.now() - start);
         const errMsg = String(err && err.message ? err.message : err);
@@ -301,19 +174,102 @@ async function probeIP(ip) {
             aborted ||
             (err && err.name === "AbortError") ||
             rawLatency > HTTP_TIMEOUT_PROBE ||
-            /AbortError|timeout|timed\s*out|超时|-1001/i.test(errMsg);
+            /AbortError|timed\s*out|超时|-1001/i.test(errMsg);
         const isTcpConnectFail =
             /refused|unreachable|no route|reset|cannot connect|could not connect|network connection was lost|not connected|socket hang up|无法连接|未能连接|拒绝|不可达|重置|断开|-1004|-1005|-1009/i.test(errMsg);
 
         if (isAbortOrTimeout || isTcpConnectFail) {
-            return markTimeout(isAbortOrTimeout ? "超时 (>2000ms)" : errMsg);
+            return fail(isAbortOrTimeout ? "超时 (>2000ms)" : errMsg);
         }
-        return processResult(0);
+        return succeed(0);
     }
 }
 
+async function runPool(items, concurrency, taskFn) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(concurrency, items.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+            const current = nextIndex++;
+            results[current] = await taskFn(items[current], current);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
+async function probeAndRank(candidateIPs) {
+    // 第 1 阶段：全量初筛（直连探测 + 实时剔除 Error 1034 与超时/拒绝节点）
+    log("第 1 阶段：初筛 " + candidateIPs.length + " 个候选节点");
+    const firstPass = await runPool(candidateIPs, PROBE_CONCURRENCY, async (ip, idx) => {
+        const res = await probeOnce(ip);
+        if (!res.ok) {
+            log("初筛淘汰 " + ip + " (#" + (idx + 1) + "): " + res.reason);
+            return null;
+        }
+        return {
+            ip: ip,
+            sourceIndex: idx,
+            firstLatency: res.rawLatency,
+            preScore: res.rawLatency + idx * RANK_PENALTY_MS
+        };
+    });
+
+    const passed = firstPass
+        .filter(Boolean)
+        .sort((a, b) => a.preScore - b.preScore);
+
+    log("初筛通过数量: " + passed.length);
+    if (passed.length === 0) return [];
+
+    // 第 2 阶段：对靠前的候选节点做 2 轮复测（合计 3 轮），评估真实均值延迟与抖动
+    const shortlist = passed.slice(0, Math.max(TOP_COUNT * 3, 10));
+    log("第 2 阶段：对前 " + shortlist.length + " 个候选节点执行稳定性复测");
+
+    const verified = await runPool(shortlist, PROBE_CONCURRENCY, async (item) => {
+        const latencies = [item.firstLatency];
+        for (let r = 0; r < REPROBE_ROUNDS; r++) {
+            const res = await probeOnce(item.ip);
+            if (!res.ok) {
+                log("复测淘汰 " + item.ip + " (#" + (item.sourceIndex + 1) + "): " + res.reason);
+                return null;
+            }
+            latencies.push(res.rawLatency);
+        }
+
+        const avgLatency = Math.round(latencies.reduce((s, v) => s + v, 0) / latencies.length);
+        const jitter = Math.max(...latencies) - Math.min(...latencies);
+        const score = Math.round(avgLatency + jitter * 0.5 + item.sourceIndex * RANK_PENALTY_MS);
+
+        log(
+            "复测通过 " + item.ip + " (#" + (item.sourceIndex + 1) + "): " +
+            "均值 " + avgLatency + "ms, 抖动 " + jitter + "ms, 综合分 " + score
+        );
+
+        return {
+            ip: item.ip,
+            sourceRank: item.sourceIndex + 1,
+            avgLatency: avgLatency,
+            jitter: jitter,
+            score: score
+        };
+    });
+
+    return verified
+        .filter(Boolean)
+        .sort((a, b) => a.score - b.score);
+}
+
+function isSameIPSet(listA, listB) {
+    if (listA.length !== listB.length) return false;
+    const a = [...listA].sort();
+    const b = [...listB].sort();
+    return a.every((v, i) => v === b[i]);
+}
+
 async function main() {
-    log("修复版启动");
+    log("Emby 优化版启动");
     log("线路: " + ISP_TYPE);
     log("优选数量: " + TOP_COUNT);
     log("本地测速: " + (ENABLE_PROBE ? "开启" : "关闭"));
@@ -326,29 +282,6 @@ async function main() {
     if (!sourceUrl) {
         throw new Error("IP 数据源地址为空");
     }
-
-    const headers = {
-        "Authorization": "Bearer " + CF_TOKEN,
-        "Content-Type": "application/json"
-    };
-
-    const listUrl =
-        "https://api.cloudflare.com/client/v4/zones/" +
-        encodeURIComponent(ZONE_ID) +
-        "/dns_records?type=A&name=" +
-        encodeURIComponent(RECORD_NAME) +
-        "&per_page=100";
-
-    log("正在查询 Cloudflare DNS 记录");
-    const listResult = await httpRequest("get", {
-        url: listUrl,
-        headers: headers,
-        timeout: HTTP_TIMEOUT_CF
-    });
-
-    const listJson = assertCloudflare(listResult, "查询 DNS 记录");
-    const existing = Array.isArray(listJson.result) ? listJson.result : [];
-    log("现有 A 记录数量: " + existing.length);
 
     log("正在拉取 IP 数据源: " + sourceUrl);
     const sourceResult = await httpRequest("get", {
@@ -376,50 +309,13 @@ async function main() {
         throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
     }
 
-    const existingRawIPs = existing.map(r => String(r.content || "").trim()).filter(Boolean);
     let selectedIPs = [];
-    let selectedMetrics = [];
 
     if (ENABLE_PROBE) {
-        const candidateSet = new Set(candidateIPs);
-        const activeCandidates = [...new Set(existingRawIPs)].filter(ip => candidateSet.has(ip));
-        let healthyExisting = [];
-
-        if (activeCandidates.length > 0) {
-            log("优先复测在岗 IP (" + activeCandidates.length + " 个)");
-            const activeFirst = await probeBatch(activeCandidates);
-            const activeVerified = await verifyStability(activeFirst, RETEST_EXTRA_ROUNDS);
-            healthyExisting = activeVerified.filter(m => m.lossRate === 0);
-            log("在岗零丢包数量: " + healthyExisting.length);
-        }
-
-        if (healthyExisting.length >= TOP_COUNT) {
-            selectedMetrics = healthyExisting.slice(0, TOP_COUNT);
-            selectedIPs = selectedMetrics.map(m => m.ip);
-            log("在岗 IP 全部零丢包健康，跳过全池测速");
-        } else {
-            const testedSet = new Set(activeCandidates);
-            const remainingCandidates = candidateIPs.filter(ip => !testedSet.has(ip));
-            log("在岗 IP 不足，开始全池初筛 (" + remainingCandidates.length + " 个)");
-            const remainingFirst = await probeBatch(remainingCandidates);
-            const stage1Passed = remainingFirst
-                .filter(r => r && r.ok)
-                .sort((a, b) => a.rawLatency - b.rawLatency);
-
-            log("初筛可达数量: " + stage1Passed.length);
-
-            const shortlist = stage1Passed.slice(0, RETEST_TOP_LIMIT);
-            log("对初筛前 " + shortlist.length + " 个候选进行 " + (1 + RETEST_EXTRA_ROUNDS) + " 轮稳定性复测");
-            const verifiedRemaining = await verifyStability(shortlist, RETEST_EXTRA_ROUNDS);
-
-            const combined = sortByStability(healthyExisting.concat(verifiedRemaining));
-            const zeroLoss = combined.filter(m => m.lossRate === 0);
-            const finalPool = zeroLoss.length >= TOP_COUNT ? zeroLoss : combined;
-
-            selectedMetrics = finalPool.slice(0, TOP_COUNT);
-            selectedIPs = selectedMetrics.map(m => m.ip);
-            log("最终优选结果: " + JSON.stringify(selectedMetrics));
-        }
+        const ranked = await probeAndRank(candidateIPs);
+        selectedIPs = ranked.slice(0, TOP_COUNT).map(r => r.ip);
+        log("复测通过数量: " + ranked.length);
+        log("最终优选结果: " + JSON.stringify(ranked.slice(0, TOP_COUNT)));
     } else {
         selectedIPs = candidateIPs.slice(0, TOP_COUNT);
         log("关闭本地测速，选取: " + selectedIPs.join(", "));
@@ -429,22 +325,38 @@ async function main() {
         throw new Error("没有可用 IP，原 DNS 记录保持不变");
     }
 
-    const ipSummaryText = selectedMetrics.length > 0
-        ? selectedMetrics.map(m => m.ip + " (" + m.avgLatency + "ms)").join(", ")
-        : selectedIPs.join(", ");
+    const headers = {
+        "Authorization": "Bearer " + CF_TOKEN,
+        "Content-Type": "application/json"
+    };
 
-    const summary =
-        "域名: " + RECORD_NAME +
-        "\n线路: " + ISP_TYPE +
-        "\n当前 IP: " + ipSummaryText;
+    const listUrl =
+        "https://api.cloudflare.com/client/v4/zones/" +
+        encodeURIComponent(ZONE_ID) +
+        "/dns_records?type=A&name=" +
+        encodeURIComponent(RECORD_NAME) +
+        "&per_page=100";
 
-    if (isSameIPList(existingRawIPs, selectedIPs)) {
-        log("DNS 记录无变化，跳过更新");
-        notify(
-            "✅ CF 优选 DNS 无需更新",
-            "当前 " + selectedIPs.length + " 条 A 记录均保持不变",
-            summary
-        );
+    log("正在查询 Cloudflare DNS 记录");
+    const listResult = await httpRequest("get", {
+        url: listUrl,
+        headers: headers,
+        timeout: HTTP_TIMEOUT_CF
+    });
+
+    const listJson = assertCloudflare(listResult, "查询 DNS 记录");
+    const existing = Array.isArray(listJson.result) ? listJson.result : [];
+    const existingIPs = existing.map(r => String(r.content || "").trim());
+    log("现有 A 记录数量: " + existing.length);
+
+    // DNS 无变化时跳过写入，避免无谓刷新 DNS 导致 Emby 正在播放的流中断
+    if (isSameIPSet(existingIPs, selectedIPs)) {
+        const summary =
+            "域名: " + RECORD_NAME +
+            "\n线路: " + ISP_TYPE +
+            "\n当前 IP: " + selectedIPs.join(", ");
+        log("DNS 记录未变化，跳过更新");
+        notify("✅ CF 优选 DNS 无需更新", "当前节点已是最优", summary);
         return;
     }
 
@@ -512,6 +424,11 @@ async function main() {
             assertCloudflare(deleteResult, "删除多余记录 " + recId);
         }
     }
+
+    const summary =
+        "域名: " + RECORD_NAME +
+        "\n线路: " + ISP_TYPE +
+        "\n更新 IP: " + selectedIPs.join(", ");
 
     log("全部更新完成");
     notify(
