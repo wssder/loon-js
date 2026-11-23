@@ -1,19 +1,15 @@
-#!name = CF 优选 DNS 更新修复版
-#!desc = 支持 CFYes、Mia、WeTest、UOUIN 和自定义线路，支持在岗保活、3 轮本地延迟与抖动复测及 Cloudflare DNS 自动更新。
-#!author = @wssder
-#!homepage = https://github.com/wssder/loon-js
-#!date = 2026-11-22
-#!system = iOS, iPadOS, macOS
-#!loon_version = 3.5.1
+#!name = CF 优选 DNS 更新
+#!desc = 定时拉取 Cloudflare 优选 IP 并自动更新 Cloudflare DNS A 记录（适配 Emby 反代）
+#!author = wssder
 
 [Argument]
-isp_type = select, "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 选择 IP 数据源。
-ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取最快或列表靠前的前 N 个 IP。
-enable_probe = switch, false, tag = [测速]手机本地二次测速, desc = 开启后通过手机网络测速；关闭则直接使用数据源前 N 个 IP。
+isp_type = select, "V2Too_CM", "V2Too_CT", "V2Too_CU", "UOUIN", "CFYes", "Mia", "WeTest", "Custom_自定义", tag = [优选源]线路 API, desc = 选择 IP 数据源，默认使用 ip.v2too.top 中国移动带宽排序源。
+ip_count = select, "3", "1", "2", "5", tag = [DNS]优选数量, desc = 选取综合最优的前 N 个 IP。
+enable_probe = switch, true, tag = [测速]手机本地二次测速, desc = 开启后通过本地直连复测延迟、抖动并过滤 Error 1034；关闭则直接使用数据源前 N 个 IP。
 cf_token = input, "", tag = [Cloudflare]API Token, desc = 需要具有 Zone DNS 编辑权限。
 zone_id = input, "", tag = [Cloudflare]Zone ID, desc = Cloudflare 域名 Zone ID。
 record_name = input, "", tag = [DNS]域名, desc = 需要更新的完整 DNS 主机名。
-custom_api = input, "https://bestcf.tools12345.com/cmliu2/all.txt", tag = [高级]自定义 API, desc = 选择 Custom_自定义 时使用的 IP 文本源地址。
+custom_api = input, "https://ip.v2too.top/api/nodes?carrier=cm", tag = [高级]自定义 API, desc = 选择 Custom_自定义 时使用的 IP 数据源地址。
 cron_exp = input, "0 4 * * *", tag = [定时]Cron, desc = 默认每天凌晨 4 点运行。
 
 [Script]
