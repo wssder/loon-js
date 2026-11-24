@@ -1,10 +1,10 @@
 /**
- * CF 优选 DNS 更新（Emby 观影优化版）
+ * CF 优选 DNS 更新（Emby 观影优化版 - 通用多源 + 自动识别本机运营商）
  * Loon 专用
  */
 
 const args = ($argument && typeof $argument === "object") ? $argument : {};
-const ISP_TYPE = String(args.isp_type || "V2Too_CM");
+const ISP_TYPE = String(args.isp_type || "V2Too_Auto");
 const TOP_COUNT = Math.max(1, Math.min(5, parseInt(args.ip_count || "3", 10) || 3));
 const ENABLE_PROBE = args.enable_probe === undefined ? true : (args.enable_probe === true || args.enable_probe === "true");
 const CF_TOKEN = String(args.cf_token || "").trim();
@@ -12,17 +12,33 @@ const ZONE_ID = String(args.zone_id || "").trim();
 const RECORD_NAME = String(args.record_name || "").trim();
 const CUSTOM_API = String(args.custom_api || "").trim();
 
+const V2TOO_API_BASE = "https://ip.v2too.top/api/nodes";
+
 const SOURCE_MAP = {
-    "V2Too_CM": "https://ip.v2too.top/api/nodes?carrier=cm",
-    "V2Too_CT": "https://ip.v2too.top/api/nodes?carrier=ct",
-    "V2Too_CU": "https://ip.v2too.top/api/nodes?carrier=cu",
+    "V2Too_Auto": V2TOO_API_BASE + "?carrier={carrier}",
+    "V2Too_CM": V2TOO_API_BASE + "?carrier=cm",
+    "V2Too_CT": V2TOO_API_BASE + "?carrier=ct",
+    "V2Too_CU": V2TOO_API_BASE + "?carrier=cu",
+    "UOUIN": "https://bestcf.tools12345.com/uouin/all.txt",
     "CFYes": "https://bestcf.tools12345.com/cfyes/ipv4.txt",
     "Mia": "https://bestcf.tools12345.com/xinyitang3/ipv4.txt",
     "WeTest": "https://bestcf.tools12345.com/wetest/ipv4.txt",
-    "UOUIN": "https://bestcf.tools12345.com/uouin/all.txt",
     "Custom_自定义": CUSTOM_API
 };
 
+const CARRIER_META = {
+    cm: { label: "中国移动", shortCn: "移动", code: "cm", upper: "CM", isp: "CMCC", regex: /移动|China\s*Mobile|CMCC|CMNET/i },
+    ct: { label: "中国电信", shortCn: "电信", code: "ct", upper: "CT", isp: "CTCC", regex: /电信|China\s*Telecom|CHINANET|CTCC|CTNET/i },
+    cu: { label: "中国联通", shortCn: "联通", code: "cu", upper: "CU", isp: "CUCC", regex: /联通|China\s*Unicom|CUCC|UNICOM/i }
+};
+
+const ISP_DETECT_ENDPOINTS = [
+    { name: "myip.ipip.net", url: "https://myip.ipip.net/json" },
+    { name: "api.vore.top", url: "https://api.vore.top/api/IPdata?ip=" },
+    { name: "api.ip.sb", url: "https://api.ip.sb/geoip" }
+];
+
+const HTTP_TIMEOUT_ISP = 5000;
 const HTTP_TIMEOUT_SOURCE = 15000;
 const HTTP_TIMEOUT_PROBE = 2000;
 const PROBE_CONCURRENCY = 4;
@@ -94,9 +110,80 @@ function assertCloudflare(result, label) {
     return json;
 }
 
+function matchCarrier(text) {
+    const raw = String(text || "");
+    if (CARRIER_META.cm.regex.test(raw)) return "cm";
+    if (CARRIER_META.ct.regex.test(raw)) return "ct";
+    if (CARRIER_META.cu.regex.test(raw)) return "cu";
+    return "";
+}
+
+async function detectLocalCarrier() {
+    for (const ep of ISP_DETECT_ENDPOINTS) {
+        try {
+            const res = await httpRequest("get", {
+                url: ep.url,
+                timeout: HTTP_TIMEOUT_ISP,
+                node: "DIRECT",
+                headers: { "User-Agent": "Loon-CF-DNS-Updater/1.0" }
+            });
+            const status = Number(res.resp.status || res.resp.statusCode || 0);
+            if (status >= 200 && status < 300) {
+                const carrier = matchCarrier(res.data);
+                if (carrier) {
+                    log("自动识别本机运营商: " + CARRIER_META[carrier].label + " (" + carrier + ") [来源: " + ep.name + "]");
+                    return carrier;
+                }
+            }
+        } catch (err) {
+            log("运营商识别接口 " + ep.name + " 失败: " + String(err && err.message ? err.message : err));
+        }
+    }
+    log("未能识别三大运营商（可能为非三网或境外网络），默认回退为 cm (中国移动)");
+    return "cm";
+}
+
+function resolveSourceUrl(rawUrl, carrier) {
+    const meta = CARRIER_META[carrier] || CARRIER_META.cm;
+    let url = String(rawUrl || "").trim();
+    if (!url) return "";
+
+    // 兼容直接填入 https://ip.v2too.top 或 https://ip.v2too.top/api/nodes
+    if (/^https?:\/\/ip\.v2too\.top\/?$/i.test(url)) {
+        url = V2TOO_API_BASE + "?carrier=" + meta.code;
+    } else if (/ip\.v2too\.top\/api\/nodes/i.test(url) && !/[?&]carrier=/i.test(url) && !/\{carrier\}/i.test(url)) {
+        url = url + (url.includes("?") ? "&" : "?") + "carrier=" + meta.code;
+    }
+
+    // 通用占位符替换，适配任意自定义接口（如 ?isp={carrier}、/{isp}.txt、?line={isp_cn}）
+    return url
+        .replace(/\{carrier\}/g, meta.code)
+        .replace(/\{CARRIER\}/g, meta.upper)
+        .replace(/\{isp\}/g, meta.isp)
+        .replace(/\{isp_cn\}/g, encodeURIComponent(meta.shortCn));
+}
+
 function extractIPs(text) {
     const regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
     return [...new Set(String(text || "").match(regex) || [])];
+}
+
+function extractIPsForCarrier(text, carrier) {
+    const raw = String(text || "");
+    const meta = CARRIER_META[carrier];
+    if (meta) {
+        // 仅当文本中同时包含多个运营商标签时，按行优先提取本机运营商对应的 IP
+        const detectedCarrierCount = ["cm", "ct", "cu"].filter(k => CARRIER_META[k].regex.test(raw)).length;
+        if (detectedCarrierCount >= 2) {
+            const matchedLines = raw.split(/\r?\n/).filter(line => meta.regex.test(line));
+            const filteredIPs = extractIPs(matchedLines.join("\n"));
+            if (filteredIPs.length > 0) {
+                log("检测到多运营商混合文本，已按 " + meta.label + " 筛出 " + filteredIPs.length + " 个候选 IP");
+                return filteredIPs;
+            }
+        }
+    }
+    return extractIPs(raw);
 }
 
 function hasError1034(bodyText) {
@@ -268,9 +355,66 @@ function isSameIPSet(listA, listB) {
     return a.every((v, i) => v === b[i]);
 }
 
+async function fetchCandidatesFromSources(rawSourceSpec, carrier) {
+    // 支持在 custom_api 中用英文逗号分隔多个数据源，按顺序拉取并去重合并
+    const rawUrls = String(rawSourceSpec || "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean);
+
+    if (rawUrls.length === 0) {
+        throw new Error("IP 数据源地址为空");
+    }
+
+    const merged = [];
+    const seen = new Set();
+    const errors = [];
+
+    for (const rawUrl of rawUrls) {
+        const url = resolveSourceUrl(rawUrl, carrier);
+        try {
+            log("正在拉取 IP 数据源: " + url);
+            const sourceResult = await httpRequest("get", {
+                url: url,
+                timeout: HTTP_TIMEOUT_SOURCE,
+                headers: {
+                    "User-Agent": "Loon-CF-DNS-Updater/1.0"
+                }
+            });
+            const sourceStatus = assertHTTP(sourceResult, "IP 数据源");
+            const sourceText = String(sourceResult.data || "");
+            log("数据源 HTTP 状态: " + sourceStatus + ", 响应长度: " + sourceText.length);
+
+            if (!sourceText.trim()) {
+                errors.push(url + " 返回空内容");
+                continue;
+            }
+
+            const ips = extractIPsForCarrier(sourceText, carrier);
+            log("从该源提取候选 IPv4 数量: " + ips.length);
+            for (const ip of ips) {
+                if (!seen.has(ip)) {
+                    seen.add(ip);
+                    merged.push(ip);
+                }
+            }
+        } catch (err) {
+            const msg = err && err.message ? err.message : String(err);
+            log("拉取数据源失败 (" + url + "): " + msg);
+            errors.push(msg);
+        }
+    }
+
+    if (merged.length === 0) {
+        throw new Error("没有解析到有效 IPv4: " + errors.join(" | "));
+    }
+
+    return merged;
+}
+
 async function main() {
     log("Emby 优化版启动");
-    log("线路: " + ISP_TYPE);
+    log("线路模式: " + ISP_TYPE);
     log("优选数量: " + TOP_COUNT);
     log("本地测速: " + (ENABLE_PROBE ? "开启" : "关闭"));
 
@@ -278,36 +422,21 @@ async function main() {
         throw new Error("参数不完整，请检查 Token、Zone ID 和反代子域名");
     }
 
-    const sourceUrl = SOURCE_MAP[ISP_TYPE] || CUSTOM_API;
-    if (!sourceUrl) {
+    const rawSourceSpec = SOURCE_MAP[ISP_TYPE] || CUSTOM_API;
+    if (!rawSourceSpec) {
         throw new Error("IP 数据源地址为空");
     }
 
-    log("正在拉取 IP 数据源: " + sourceUrl);
-    const sourceResult = await httpRequest("get", {
-        url: sourceUrl,
-        timeout: HTTP_TIMEOUT_SOURCE,
-        headers: {
-            "User-Agent": "Loon-CF-DNS-Updater/1.0"
-        }
-    });
+    // 固定线路 V2Too_CM/CT/CU 直接锁定对应运营商；其余模式（含 V2Too_Auto、UOUIN、Custom_自定义）均先直连识别本机运营商
+    let carrier = "";
+    if (ISP_TYPE === "V2Too_CM") carrier = "cm";
+    else if (ISP_TYPE === "V2Too_CT") carrier = "ct";
+    else if (ISP_TYPE === "V2Too_CU") carrier = "cu";
+    else carrier = await detectLocalCarrier();
 
-    const sourceStatus = assertHTTP(sourceResult, "IP 数据源");
-    const sourceText = String(sourceResult.data || "");
-
-    log("数据源 HTTP 状态: " + sourceStatus);
-    log("数据源响应长度: " + sourceText.length);
-
-    if (!sourceText.trim()) {
-        throw new Error("IP 数据源返回空内容");
-    }
-
-    const candidateIPs = extractIPs(sourceText);
-    log("解析到候选 IPv4 数量: " + candidateIPs.length);
-
-    if (candidateIPs.length === 0) {
-        throw new Error("没有解析到有效 IPv4: " + sourceText.slice(0, 300));
-    }
+    const routeLabel = ISP_TYPE + " (" + CARRIER_META[carrier].label + "/" + carrier + ")";
+    const candidateIPs = await fetchCandidatesFromSources(rawSourceSpec, carrier);
+    log("合计去重候选 IPv4 数量: " + candidateIPs.length);
 
     let selectedIPs = [];
 
@@ -353,7 +482,7 @@ async function main() {
     if (isSameIPSet(existingIPs, selectedIPs)) {
         const summary =
             "域名: " + RECORD_NAME +
-            "\n线路: " + ISP_TYPE +
+            "\n线路: " + routeLabel +
             "\n当前 IP: " + selectedIPs.join(", ");
         log("DNS 记录未变化，跳过更新");
         notify("✅ CF 优选 DNS 无需更新", "当前节点已是最优", summary);
@@ -427,7 +556,7 @@ async function main() {
 
     const summary =
         "域名: " + RECORD_NAME +
-        "\n线路: " + ISP_TYPE +
+        "\n线路: " + routeLabel +
         "\n更新 IP: " + selectedIPs.join(", ");
 
     log("全部更新完成");
