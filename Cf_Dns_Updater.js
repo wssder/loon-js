@@ -262,9 +262,10 @@ async function probeOnce(ip) {
             }, HTTP_TIMEOUT_PROBE);
 
             httpRequest("get", {
-                url: "http://" + ip + "/cdn-cgi/trace",
+                url: "https://" + ip + "/cdn-cgi/trace",
                 timeout: HTTP_TIMEOUT_PROBE + 500,
                 node: "DIRECT",
+                insecure: true,
                 "auto-redirect": false
             }).then(res => {
                 if (settled) return;
@@ -324,6 +325,28 @@ async function probeOnce(ip) {
             (err && err.name === "AbortError") ||
             rawLatency > HTTP_TIMEOUT_PROBE ||
             /AbortError|timed\s*out|超时|-1001/i.test(errMsg);
+
+        // 裸 IP 直连 443 端口时，CF 会因无 SNI 立即回发 TLS Handshake Failure，收到该回复即说明 443 端口连通且耗时为真实 RTT
+        const isTlsHandshakeReply =
+            !isAbortOrTimeout &&
+            /LNGCDAsyncSocketTLSError|ssl\/tls alert|handshake failure|SSL handshake failed|certificate|tls/i.test(errMsg) &&
+            !/timed\s*out|refused|reset|unreachable|cannot connect|closed|eof|-1001|-1004|-1005|-1009/i.test(errMsg);
+
+        if (isTlsHandshakeReply) {
+            if (rawLatency < MIN_LATENCY_MS) {
+                return fail("延迟异常过低 (" + rawLatency + "ms < " + MIN_LATENCY_MS + "ms)");
+            }
+            if (rawLatency > MAX_LATENCY_MS) {
+                return fail("延迟过高 (" + rawLatency + "ms > " + MAX_LATENCY_MS + "ms)");
+            }
+            return {
+                ip: ip,
+                rawLatency: rawLatency,
+                colo: "TLS",
+                ok: true,
+                httpStatus: 0
+            };
+        }
 
         return fail(isAbortOrTimeout ? "超时 (>" + HTTP_TIMEOUT_PROBE + "ms)" : "请求异常: " + errMsg);
     }
