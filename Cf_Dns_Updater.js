@@ -52,7 +52,7 @@ const MIN_LATENCY_MS = 5;        // 延迟下限（排除误走代理；若想�
 const MAX_LATENCY_MS = 500;      // 延迟上限（剔除高延迟慢节点）
 const MAX_LOSS_RATE = 0.25;      // 最大容忍丢包率（0 丢包永远排最前，晚高峰允许 <=25% 丢包兜底）
 const RANK_PENALTY_MS = 15;      // 保留源站带宽排名权重，避免低速节点凭几毫秒延迟反超高速节点
-const VALID_HTTP_CODES = [200, 301, 302]; // HTTPing 合法状态码（对齐 cfst -httping-code 默认值）
+const VALID_HTTP_CODES = [200, 301, 302, 403]; // HTTPing 合法状态码（裸 IP 直连 CF 返回 403/1003 属正常，Error 1034 仍单独拦截）
 const COLO_WHITELIST = [];       // 可选：仅保留指定机房地区码，如 ["NRT", "KIX", "SIN", "LAX"]；留空不限制
 const COLO_BLACKLIST = [];       // 可选：排除指定机房地区码，如 ["HKG"]；留空不排除
 
@@ -262,10 +262,9 @@ async function probeOnce(ip) {
             }, HTTP_TIMEOUT_PROBE);
 
             httpRequest("get", {
-                url: "https://" + ip + "/cdn-cgi/trace",
+                url: "http://" + ip + "/cdn-cgi/trace",
                 timeout: HTTP_TIMEOUT_PROBE + 500,
                 node: "DIRECT",
-                insecure: true,
                 "auto-redirect": false
             }).then(res => {
                 if (settled) return;
