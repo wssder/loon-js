@@ -42,7 +42,8 @@ const HTTP_TIMEOUT_ISP = 5000;
 const HTTP_TIMEOUT_SOURCE = 15000;
 const HTTP_TIMEOUT_PROBE = 2000;
 const PROBE_CONCURRENCY = 4;
-const REPROBE_ROUNDS = 2; // 初筛 1 轮 + 复测 2 轮 = 共 3 轮稳定性验证
+const REPROBE_ROUNDS = 4; // 初筛 1 轮 + 复测 4 轮 = 共 5 轮稳定性验证
+const BURST_CONCURRENCY = 4; // 突发压测单节点并发请求数
 const RANK_PENALTY_MS = 15; // 保留源站带宽排名权重，避免低速节点凭几毫秒延迟反超高速节点
 const HTTP_TIMEOUT_CF = 15000;
 
@@ -286,6 +287,32 @@ async function runPool(items, concurrency, taskFn) {
     return results;
 }
 
+async function burstProbe(ip, concurrency) {
+    const tasks = Array.from({ length: concurrency }, () => probeOnce(ip));
+    const results = await Promise.all(tasks);
+    const failed = results.filter(r => !r.ok);
+    if (failed.length > 0) {
+        return {
+            ok: false,
+            failedCount: failed.length,
+            totalCount: concurrency,
+            reason: failed[0].reason
+        };
+    }
+
+    const latencies = results.map(r => r.rawLatency);
+    const avgLatency = Math.round(latencies.reduce((s, v) => s + v, 0) / latencies.length);
+    const maxLatency = Math.max(...latencies);
+    const jitter = maxLatency - Math.min(...latencies);
+
+    return {
+        ok: true,
+        avgLatency: avgLatency,
+        maxLatency: maxLatency,
+        jitter: jitter
+    };
+}
+
 async function probeAndRank(candidateIPs) {
     // 第 1 阶段：全量初筛（直连探测 + 实时剔除 Error 1034 与超时/拒绝节点）
     log("第 1 阶段：初筛 " + candidateIPs.length + " 个候选节点");
@@ -310,16 +337,16 @@ async function probeAndRank(candidateIPs) {
     log("初筛通过数量: " + passed.length);
     if (passed.length === 0) return [];
 
-    // 第 2 阶段：对靠前的候选节点做 2 轮复测（合计 3 轮），评估真实均值延迟与抖动
+    // 第 2 阶段：对靠前的候选节点做 4 轮复测（初筛 1 轮 + 复测 4 轮 = 合计 5 轮），评估真实均值延迟与抖动
     const shortlist = passed.slice(0, Math.max(TOP_COUNT * 3, 10));
-    log("第 2 阶段：对前 " + shortlist.length + " 个候选节点执行稳定性复测");
+    log("第 2 阶段：对前 " + shortlist.length + " 个候选节点执行 " + REPROBE_ROUNDS + " 轮稳定性复测");
 
     const verified = await runPool(shortlist, PROBE_CONCURRENCY, async (item) => {
         const latencies = [item.firstLatency];
         for (let r = 0; r < REPROBE_ROUNDS; r++) {
             const res = await probeOnce(item.ip);
             if (!res.ok) {
-                log("复测淘汰 " + item.ip + " (#" + (item.sourceIndex + 1) + "): " + res.reason);
+                log("复测淘汰 " + item.ip + " (#" + (item.sourceIndex + 1) + ") [第 " + (r + 1) + "/" + REPROBE_ROUNDS + " 轮]: " + res.reason);
                 return null;
             }
             latencies.push(res.rawLatency);
@@ -331,11 +358,12 @@ async function probeAndRank(candidateIPs) {
 
         log(
             "复测通过 " + item.ip + " (#" + (item.sourceIndex + 1) + "): " +
-            "均值 " + avgLatency + "ms, 抖动 " + jitter + "ms, 综合分 " + score
+            "均值 " + avgLatency + "ms, 抖动 " + jitter + "ms, 复测分 " + score
         );
 
         return {
             ip: item.ip,
+            sourceIndex: item.sourceIndex,
             sourceRank: item.sourceIndex + 1,
             avgLatency: avgLatency,
             jitter: jitter,
@@ -343,9 +371,62 @@ async function probeAndRank(candidateIPs) {
         };
     });
 
-    return verified
+    const reprobed = verified
         .filter(Boolean)
         .sort((a, b) => a.score - b.score);
+
+    log("复测通过数量: " + reprobed.length);
+    if (reprobed.length === 0) return [];
+
+    // 第 3 阶段：对复测靠前的候选节点逐个发起并发突发压测，筛选高并发下不丢包、不飙延迟的节点
+    const burstCandidates = reprobed.slice(0, Math.max(TOP_COUNT * 2, 6));
+    log("第 3 阶段：对前 " + burstCandidates.length + " 个候选节点执行 " + BURST_CONCURRENCY + " 路并发突发压测");
+
+    const burstPassed = [];
+    for (const item of burstCandidates) {
+        const burst = await burstProbe(item.ip, BURST_CONCURRENCY);
+        if (!burst.ok) {
+            log(
+                "突发压测淘汰 " + item.ip + " (#" + item.sourceRank + "): " +
+                "失败 " + burst.failedCount + "/" + burst.totalCount + " (" + burst.reason + ")"
+            );
+            continue;
+        }
+
+        const burstSpike = Math.max(0, burst.maxLatency - item.avgLatency);
+        const finalScore = Math.round(
+            item.avgLatency * 0.5 +
+            burst.avgLatency * 0.5 +
+            item.jitter * 0.4 +
+            burst.jitter * 0.4 +
+            burstSpike * 0.2 +
+            item.sourceIndex * RANK_PENALTY_MS
+        );
+
+        log(
+            "突发压测通过 " + item.ip + " (#" + item.sourceRank + "): " +
+            "并发均值 " + burst.avgLatency + "ms, 峰值 " + burst.maxLatency + "ms, " +
+            "并发抖动 " + burst.jitter + "ms, 最终综合分 " + finalScore
+        );
+
+        burstPassed.push({
+            ip: item.ip,
+            sourceRank: item.sourceRank,
+            avgLatency: item.avgLatency,
+            jitter: item.jitter,
+            burstAvg: burst.avgLatency,
+            burstMax: burst.maxLatency,
+            burstJitter: burst.jitter,
+            score: finalScore
+        });
+    }
+
+    if (burstPassed.length === 0) {
+        log("突发压测未有节点全数通过，回退采用第 2 阶段复测结果");
+        return reprobed.map(({ sourceIndex, ...rest }) => rest);
+    }
+
+    return burstPassed.sort((a, b) => a.score - b.score);
 }
 
 function isSameIPSet(listA, listB) {
@@ -443,7 +524,7 @@ async function main() {
     if (ENABLE_PROBE) {
         const ranked = await probeAndRank(candidateIPs);
         selectedIPs = ranked.slice(0, TOP_COUNT).map(r => r.ip);
-        log("复测通过数量: " + ranked.length);
+        log("压测通过数量: " + ranked.length);
         log("最终优选结果: " + JSON.stringify(ranked.slice(0, TOP_COUNT)));
     } else {
         selectedIPs = candidateIPs.slice(0, TOP_COUNT);
